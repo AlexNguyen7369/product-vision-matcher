@@ -26,6 +26,11 @@ class ProcessedImage:
 `reverse_search` only uses `encoded` and `format`. `size` is carried through
 the dataclass for debugging but is not sent to SerpAPI.
 
+`ProcessedImage` is defined in `models.py` and imported from there.
+`reverse_search` no longer imports `image_processor` (which would pull in PIL,
+`pathlib`, and `io`) merely to name the type — it depends on the lightweight
+shared contract instead.
+
 ---
 
 ## Output Contract
@@ -67,60 +72,78 @@ inspect them — useful when debugging why a listing was or wasn't found.
 ## Public Surface
 
 ```python
-def search(image: ProcessedImage) -> dict
+class SerpApiSearcher:
+    def __init__(self, api_key: str | None = None,
+                 client: httpx.Client | None = None,
+                 timeout: float = 30.0) -> None: ...
+    def search(self, image: ProcessedImage) -> dict: ...
 ```
 
-That is the only public symbol. All other functions are private helpers
-prefixed with `_`.
+`SerpApiSearcher` implements the `ReverseSearchProvider` protocol (`models.py`).
+The API key and HTTP client are **injected** through the constructor instead of
+read from module-level globals:
+
+- `api_key=None` falls back to `SERPAPI_KEY` in `.env`; an explicit string
+  (including `""`) is honoured as-is, which is what lets the key guard be
+  unit-tested without touching the environment.
+- An injected `client` lets a caller supply a pooled/long-lived client, or a
+  test transport (`httpx.MockTransport`) so the request/response path runs
+  offline. When omitted, `search` opens a short-lived client per call.
+
+`pipeline` depends on the `ReverseSearchProvider` protocol, never on this
+concrete class — a local embedding/FAISS backend implementing the same
+`search(image) -> dict` method can be dropped in without changing orchestration.
+All other methods are private helpers prefixed with `_`.
 
 ---
 
 ## Pseudocode
 
 ```python
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")   # loaded from .env at module import
 _SERPAPI_URL = "https://serpapi.com/search"
-_TIMEOUT     = 30.0                       # seconds; Google Lens can be slow
+_DEFAULT_TIMEOUT = 30.0                    # seconds; Google Lens can be slow
 
 
-def search(image: ProcessedImage) -> dict:
-    _validate_key()           # fast local check before touching the network
-    response = _post(image)   # the only I/O in the module
-    _check_response(response) # raises on any non-200 so caller gets a clear error
-    return response.json()    # hand raw dict to marketplace_parser
+def _load_default_key() -> str | None:     # env read, only when no key injected
+    load_dotenv()
+    return os.getenv("SERPAPI_KEY")
 
 
-def _validate_key() -> None:
-    # Checked here rather than at module load so the error surfaces at call
-    # time (test_setup checks this explicitly).
-    if not SERPAPI_KEY:
-        raise EnvironmentError("SERPAPI_KEY not set in .env")
+class SerpApiSearcher:
+    def __init__(self, api_key=None, client=None, timeout=_DEFAULT_TIMEOUT):
+        # api_key=None → fall back to env; explicit "" is honoured (invalid key)
+        self._api_key = api_key if api_key is not None else _load_default_key()
+        self._client  = client            # injected client/transport, or None
+        self._timeout = timeout
 
+    def search(self, image: ProcessedImage) -> dict:
+        self._validate_key()              # fast local check before any network
+        response = self._post(image)      # the only I/O in the module
+        self._check_response(response)    # raises on non-200 for a clear error
+        return response.json()            # hand raw dict to marketplace_parser
 
-def _post(image: ProcessedImage) -> httpx.Response:
-    # SerpAPI Google Lens does not accept base64 strings in the request body.
-    # It expects multipart/form-data with the raw bytes in the "image" field.
-    # We therefore decode the base64 string back to bytes before uploading.
-    image_bytes = base64.b64decode(image.encoded)
-    mime = f"image/{image.format.lower()}"   # e.g. "image/jpeg"
+    def _validate_key(self) -> None:
+        if not self._api_key:
+            raise EnvironmentError("SERPAPI_KEY not set in .env")
 
-    with httpx.Client(timeout=_TIMEOUT) as client:
-        return client.post(
-            _SERPAPI_URL,
-            data  = {"engine": "google_lens", "api_key": SERPAPI_KEY},
-            files = {"image": (f"upload.{image.format.lower()}", image_bytes, mime)},
-        )
-    # httpx.Client is used as a context manager so the connection pool is
-    # released immediately after the response is received.
+    def _post(self, image: ProcessedImage) -> httpx.Response:
+        # Google Lens needs multipart/form-data with raw bytes, not base64,
+        # so decode the ProcessedImage.encoded string back to bytes first.
+        image_bytes = base64.b64decode(image.encoded)
+        fmt   = image.format.lower()      # e.g. "jpeg"
+        data  = {"engine": "google_lens", "api_key": self._api_key}
+        files = {"image": (f"upload.{fmt}", image_bytes, f"image/{fmt}")}
 
+        if self._client is not None:      # reuse injected client (pool / tests)
+            return self._client.post(_SERPAPI_URL, data=data, files=files)
+        with httpx.Client(timeout=self._timeout) as client:
+            return client.post(_SERPAPI_URL, data=data, files=files)
 
-def _check_response(response: httpx.Response) -> None:
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"SerpAPI {response.status_code}: {response.text[:300]}"
-        )
-    # 300-char truncation: SerpAPI error bodies can be large HTML pages;
-    # truncating keeps the exception message readable in logs.
+    @staticmethod
+    def _check_response(response: httpx.Response) -> None:
+        if response.status_code != 200:
+            # 300-char truncation keeps large HTML error bodies log-readable.
+            raise RuntimeError(f"SerpAPI {response.status_code}: {response.text[:300]}")
 ```
 
 ---
@@ -185,11 +208,14 @@ None of these are caught inside `reverse_search` — they propagate to
 
 ## Test Plan (section 6 in test_setup.py)
 
-| Check | Method | Why no API call |
+| Check | Method | Why no live API |
 |---|---|---|
-| Module imports with `search` and `SERPAPI_KEY` | `hasattr` | Static check |
-| `_validate_key()` raises `EnvironmentError` when key is `None` | Temporarily set `SERPAPI_KEY = None` | No I/O |
-| `_validate_key()` passes when key is a non-empty string | Set `SERPAPI_KEY = "dummy"` | No I/O |
+| Module exposes `SerpApiSearcher` | `hasattr` | Static check |
+| `_validate_key()` raises `EnvironmentError` when key is empty | `SerpApiSearcher(api_key="")` | No I/O |
+| `_validate_key()` passes when key is present | `SerpApiSearcher(api_key="dummy")` | No I/O |
+| `search()` returns the parsed JSON dict | inject `httpx.Client(transport=httpx.MockTransport(...))` returning 200 | Offline transport |
+| `search()` raises `RuntimeError` on non-200 | same, MockTransport returning 500 | Offline transport |
 
-Real HTTP calls are integration tests and require a live key + network. They
-are intentionally excluded from `test_setup.py`.
+Injecting the client is what makes the full request/response path testable
+without a live key or network — previously only `_validate_key` could be
+checked. Real SerpAPI calls remain integration-only and are excluded here.

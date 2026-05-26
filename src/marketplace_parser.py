@@ -1,26 +1,22 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from models import ParsedListing
 
 MARKETPLACE_SOURCES = {
     "amazon", "ebay", "walmart", "etsy",
     "target", "bestbuy", "newegg", "wayfair",
 }
 
-@dataclass
-class ParsedListing:
-    title:       str
-    url:         str
-    source:      str
-    price_raw:   str
-    price_value: float
-    currency:    str
-
 
 def parse(serpapi_response: dict) -> list[ParsedListing]:
+    """Extract and filter marketplace listings from a SerpAPI response.
+
+    Returns listings in source order. Ranking/ordering is intentionally left
+    to price_aggregator — the parser decides which listings are valid, the
+    aggregator decides how to present them.
+    """
     raw_matches = serpapi_response.get("visual_matches", [])
     candidates = list(filter(None, (_extract(m) for m in raw_matches)))
-    valid = [listing for listing in candidates if _passes_filter(listing)]
-    return sorted(valid, key=lambda l: l.price_value)
+    return [listing for listing in candidates if _passes_filter(listing)]
 
 
 def _extract(match: dict) -> ParsedListing | None:

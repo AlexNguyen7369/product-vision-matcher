@@ -43,12 +43,18 @@ ignored. Each match in `visual_matches` may have these fields:
 list[ParsedListing]
 ```
 
-Sorted **ascending by `price_value`** so `price_aggregator` can take `[:n]`
-without re-sorting. Only entries that pass all three filter predicates appear.
+Returned in **source order** (the order SerpAPI listed the matches). Only entries
+that pass all three filter predicates appear. Ranking is **not** done here — that
+is `price_aggregator.rank_by_price`'s job. The parser stays single-responsibility:
+it decides *which* listings are valid, not *how* they should be ordered.
 
 ---
 
 ## Data Model
+
+`ParsedListing` is defined in `models.py` (the shared-contracts module), not in
+this file — `marketplace_parser`, `price_aggregator`, and `pipeline` all import
+it from there so no module depends on another's implementation just to name a type.
 
 ```python
 @dataclass
@@ -67,7 +73,7 @@ class ParsedListing:
 
 ---
 
-## Three-Step Process
+## Two-Step Process
 
 ```
 visual_matches[]
@@ -80,15 +86,15 @@ filter(None, ...)      # removes the Nones
     │
     ▼
 _passes_filter(l)      # applies three business-logic predicates
-    │
-    ▼
-sorted(..., key=price) # ascending by price_value
 ```
 
 Separating extract from filter is deliberate: `_extract` handles *structural*
 problems (missing fields, wrong types), while `_passes_filter` handles
 *business logic* problems (wrong domain, untrustworthy price). They fail for
 different reasons and should be diagnosable independently.
+
+There is no sort step. Ordering moved to `price_aggregator` so that "what is a
+valid listing" and "how should listings be ranked" remain separate concerns.
 
 ---
 
@@ -220,41 +226,38 @@ that gracefully by defaulting to an empty list.
 
 ---
 
-## Sort Order
+## Ordering (now in price_aggregator)
+
+The parser no longer sorts. `price_aggregator.rank_by_price` owns ordering:
 
 ```python
-return sorted(valid, key=lambda l: l.price_value)
+def rank_by_price(listings: list[ParsedListing]) -> list[ParsedListing]:
+    return sorted(listings, key=lambda listing: listing.price_value)
 ```
 
-Ascending order (cheapest first) is chosen because:
-- `price_aggregator` will likely want to present the cheapest options first
-- `price_aggregator` can slice `[:n]` without re-sorting
-- Descending order can be achieved with `reversed()` at zero allocation cost
-
-`sorted()` returns a new list (stable sort, Timsort, O(n log n)). The input
-`valid` list is not mutated.
+Ascending order (cheapest first) is chosen because the aggregator can slice
+`[:n]` without re-sorting, and descending is a zero-cost `reversed()`. `sorted()`
+returns a new list (stable Timsort, O(n log n)) and does not mutate its input.
+Keeping this out of the parser means a future ranking change (e.g. weighting by
+rating or shipping cost) touches only `price_aggregator`.
 
 ---
 
 ## Full Pseudocode
 
 ```python
+from models import ParsedListing   # shared dataclass, defined once in models.py
+
 MARKETPLACE_SOURCES = {
     "amazon", "ebay", "walmart", "etsy",
     "target", "bestbuy", "newegg", "wayfair",
 }
 
-@dataclass
-class ParsedListing:
-    title: str; url: str; source: str
-    price_raw: str; price_value: float; currency: str
-
 
 def parse(serpapi_response: dict) -> list[ParsedListing]:
     raw_matches = serpapi_response.get("visual_matches", [])
     candidates  = list(filter(None, (_extract(m) for m in raw_matches)))
-    valid       = [l for l in candidates if _passes_filter(l)]
-    return sorted(valid, key=lambda l: l.price_value)
+    return [l for l in candidates if _passes_filter(l)]   # no sort — see price_aggregator
 
 
 def _extract(match: dict) -> ParsedListing | None:

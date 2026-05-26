@@ -30,18 +30,19 @@ The goal is a pipeline that takes a product image, reverse-searches it via Googl
 [image file]
     → image_processor.py   # load, validate (JPEG/PNG/WEBP only), resize to ≤1024×1024, base64-encode → ProcessedImage
     → reverse_search.py    # sends encoded image to SerpAPI Google Lens endpoint → raw search results
-    → marketplace_parser.py # extracts product listings from SerpAPI results (stub)
-    → price_aggregator.py  # aggregates/ranks prices across marketplaces (stub)
+    → marketplace_parser.py # extracts/filters product listings from SerpAPI results
+    → price_aggregator.py  # ranks listings by price (rank_by_price)
     → pipeline.py          # orchestrates the above (stub)
 ```
 
 **Key design decisions:**
-- `ProcessedImage` dataclass is the contract between `image_processor` and `reverse_search` — all downstream code receives this, never raw PIL or bytes.
+- Shared dataclasses live in `models.py`: `ProcessedImage` (the `image_processor` → `reverse_search` contract) and `ParsedListing` (the `marketplace_parser` → `price_aggregator` contract). Modules import types from `models`, never from each other, so no module depends on a sibling's implementation just to name a type.
+- `reverse_search.py` exposes `SerpApiSearcher`, which implements the `ReverseSearchProvider` protocol (`models.py`). `pipeline` depends on that protocol, not the concrete class, so a local embedding/FAISS backend can be swapped in later. API key and HTTP client are injected via the constructor (no import-time globals).
 - `data/embeddings/` is reserved for FAISS vector index files; `data/uploads/` holds input images.
 - `faiss-cpu`, `transformers`, and `torch` are installed for local embedding/similarity search (not yet wired into the pipeline — `reverse_search.py` via SerpAPI is the current approach).
 - `easyocr` is available for extracting text from product label images.
 
-**Current state:** `image_processor.py` and the SerpAPI key loading in `reverse_search.py` are the only implemented pieces. `marketplace_parser.py`, `price_aggregator.py`, and `pipeline.py` are stubs.
+**Current state:** `image_processor.py`, `reverse_search.py`, `marketplace_parser.py`, and `price_aggregator.py` (`rank_by_price`) are implemented. `pipeline.py` is the only remaining stub.
 
 ## Git Commit Policy
 

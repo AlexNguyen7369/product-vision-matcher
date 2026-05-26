@@ -75,7 +75,8 @@ run_check("SERPAPI_KEY loaded", check_serpapi_key)
 
 print("\n=== Section 2: image_processor — happy path ===")
 
-from image_processor import process_image, ProcessedImage
+from image_processor import process_image
+from models import ProcessedImage, ParsedListing
 
 def check_returns_processed_image():
     path = _make_jpeg()
@@ -133,45 +134,64 @@ run_check("BMP input raises ValueError", check_bmp_raises)
 # ── section 5: stub status ────────────────────────────────────────────────────
 
 print("\n=== Section 5: Stub module status ===")
-for module in ("price_aggregator", "pipeline"):
+for module in ("pipeline",):
     print(f"  [STUB] {module} - not yet implemented")
 
-# ── section 6: reverse_search — import & key validation ───────────────────────
+# ── section 6: reverse_search — searcher & request path ───────────────────────
 #
-# These checks never hit the SerpAPI network. They validate the module's
-# internal guard (_validate_key) and that the env-loading path behaves
-# correctly. Real HTTP calls are integration-only and require a live key.
+# No check hits the real SerpAPI network. The key guard is exercised by
+# constructing a SerpApiSearcher with an explicit key; the full request /
+# response path is exercised offline via httpx.MockTransport, so no live key
+# or network is required. Injectable key + client is what makes this testable.
 
-print("\n=== Section 6: reverse_search — import & key validation ===")
+print("\n=== Section 6: reverse_search — searcher & request path ===")
 
+import httpx
 import reverse_search as _rs
+from reverse_search import SerpApiSearcher
+
+def _tiny_image() -> ProcessedImage:
+    encoded = base64.b64encode(b"not-a-real-jpeg").decode("utf-8")
+    return ProcessedImage(encoded=encoded, format="JPEG", size=(1, 1))
 
 def check_rs_import():
-    assert hasattr(_rs, "search"),         "missing: search()"
-    assert hasattr(_rs, "SERPAPI_KEY"),    "missing: SERPAPI_KEY"
+    assert hasattr(_rs, "SerpApiSearcher"), "missing: SerpApiSearcher"
 
 def check_rs_missing_key_raises():
-    original = _rs.SERPAPI_KEY
-    _rs.SERPAPI_KEY = None
+    searcher = SerpApiSearcher(api_key="")   # explicit empty key, no env fallback
     try:
-        _rs._validate_key()
+        searcher._validate_key()
         raise AssertionError("expected EnvironmentError, got none")
     except EnvironmentError:
         pass
-    finally:
-        _rs.SERPAPI_KEY = original
 
 def check_rs_key_present_does_not_raise():
-    original = _rs.SERPAPI_KEY
-    _rs.SERPAPI_KEY = "dummy-key-for-test"
-    try:
-        _rs._validate_key()   # should not raise
-    finally:
-        _rs.SERPAPI_KEY = original
+    SerpApiSearcher(api_key="dummy-key-for-test")._validate_key()  # should not raise
 
-run_check("reverse_search imports with expected surface", check_rs_import)
-run_check("_validate_key raises EnvironmentError when key is None", check_rs_missing_key_raises)
+def check_rs_search_returns_json_offline():
+    def handler(request):
+        return httpx.Response(200, json={"visual_matches": []})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    searcher = SerpApiSearcher(api_key="dummy", client=client)
+    result = searcher.search(_tiny_image())
+    assert result == {"visual_matches": []}, f"unexpected payload: {result}"
+
+def check_rs_non_200_raises_offline():
+    def handler(request):
+        return httpx.Response(500, text="upstream error")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    searcher = SerpApiSearcher(api_key="dummy", client=client)
+    try:
+        searcher.search(_tiny_image())
+        raise AssertionError("expected RuntimeError on non-200, got none")
+    except RuntimeError:
+        pass
+
+run_check("reverse_search exposes SerpApiSearcher", check_rs_import)
+run_check("_validate_key raises EnvironmentError when key is empty", check_rs_missing_key_raises)
 run_check("_validate_key passes when key is present", check_rs_key_present_does_not_raise)
+run_check("search() returns parsed JSON via MockTransport", check_rs_search_returns_json_offline)
+run_check("search() raises RuntimeError on non-200 via MockTransport", check_rs_non_200_raises_offline)
 
 # ── section 7: marketplace_parser — filter, extraction & sort ─────────────────
 #
@@ -185,7 +205,7 @@ run_check("_validate_key passes when key is present", check_rs_key_present_does_
 
 print("\n=== Section 7: marketplace_parser — filter, extraction & sort ===")
 
-from marketplace_parser import parse, ParsedListing
+from marketplace_parser import parse
 
 _FIXTURE = {
     "visual_matches": [
@@ -230,11 +250,6 @@ def check_all_results_are_parsed_listing():
     for r in results:
         assert isinstance(r, ParsedListing), f"expected ParsedListing, got {type(r)}"
 
-def check_sorted_ascending_by_price():
-    results = parse(_FIXTURE)
-    prices = [r.price_value for r in results]
-    assert prices == sorted(prices), f"not sorted ascending: {prices}"
-
 def check_non_marketplace_filtered():
     results = parse(_FIXTURE)
     sources = {r.source for r in results}
@@ -265,7 +280,6 @@ def check_parsed_listing_fields():
 
 run_check("only 2 of 5 fixtures survive filter", check_returns_only_valid_listings)
 run_check("all results are ParsedListing instances", check_all_results_are_parsed_listing)
-run_check("results sorted ascending by price_value", check_sorted_ascending_by_price)
 run_check("non-marketplace source (Blogger) filtered out", check_non_marketplace_filtered)
 run_check("zero-price entry filtered out", check_zero_price_filtered)
 run_check("javascript: URL filtered out", check_bad_url_scheme_filtered)
@@ -365,6 +379,44 @@ run_check("browser_check_url rejects relative path", check_browser_rejects_relat
 run_check("TOOLS list contains all six required entries", check_tools_list_has_required_entries)
 run_check("run_bandit returns a non-empty string", check_bandit_returns_string)
 run_check("run_pip_audit returns a non-empty string", check_pip_audit_returns_string)
+
+# ── section 9: price_aggregator — ranking ─────────────────────────────────────
+#
+# rank_by_price owns the sort that used to live in marketplace_parser.parse().
+# Given unsorted ParsedListings it must return them cheapest-first without
+# mutating the input. The end-to-end check confirms parse() → rank is ascending.
+
+print("\n=== Section 9: price_aggregator — ranking ===")
+
+from price_aggregator import rank_by_price
+
+def _listing(price: float, title: str = "x") -> ParsedListing:
+    return ParsedListing(
+        title=title, url="https://x.com", source="Amazon",
+        price_raw=f"${price}", price_value=price, currency="$",
+    )
+
+def check_rank_sorts_ascending():
+    ranked = rank_by_price([_listing(29.99), _listing(24.50), _listing(99.00)])
+    assert [l.price_value for l in ranked] == [24.50, 29.99, 99.00], \
+        f"not ascending: {[l.price_value for l in ranked]}"
+
+def check_rank_does_not_mutate_input():
+    unsorted = [_listing(29.99), _listing(24.50)]
+    rank_by_price(unsorted)
+    assert [l.price_value for l in unsorted] == [29.99, 24.50], "input list was mutated"
+
+def check_rank_empty_list():
+    assert rank_by_price([]) == []
+
+def check_parse_then_rank_is_ascending():
+    prices = [l.price_value for l in rank_by_price(parse(_FIXTURE))]
+    assert prices == sorted(prices), f"not ascending after rank: {prices}"
+
+run_check("rank_by_price sorts ascending by price_value", check_rank_sorts_ascending)
+run_check("rank_by_price does not mutate its input", check_rank_does_not_mutate_input)
+run_check("rank_by_price handles empty list", check_rank_empty_list)
+run_check("parse() then rank_by_price yields ascending prices", check_parse_then_rank_is_ascending)
 
 # ── summary ───────────────────────────────────────────────────────────────────
 

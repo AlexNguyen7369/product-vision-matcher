@@ -1,21 +1,15 @@
 from __future__ import annotations
-from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image
 import base64
 import io
+from models import ProcessedImage
 
 SUPPORTED_FORMATS = {"JPEG", "PNG", "WEBP"}
 MAX_SIZE = (1024, 1024)
 
 # everything downstream recieves ProcessedImage, not raw PIL or bytes, should be encoded to attach to SerpAPI request body
 # load the image, resize, and validate against supported_formats, return the data as ProcessedImage
-
-@dataclass
-class ProcessedImage: 
-    encoded: str
-    format: str
-    size: tuple[int, int]
 
 def process_image(path: str) -> ProcessedImage:
     # 3 method calls, load the image, validate, and resize so it doesn't overflow the supported size (MAX_SIZE)
