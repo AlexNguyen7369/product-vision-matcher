@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from pathliib import Path
+from pathlib import Path
 from PIL import Image
 import base64
 import io
