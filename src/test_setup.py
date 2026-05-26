@@ -131,11 +131,9 @@ def check_bmp_raises():
 
 run_check("BMP input raises ValueError", check_bmp_raises)
 
-# ── section 5: stub status ────────────────────────────────────────────────────
+# ── section 5: (pipeline promoted to section 11) ─────────────────────────────
 
-print("\n=== Section 5: Stub module status ===")
-for module in ("pipeline",):
-    print(f"  [STUB] {module} - not yet implemented")
+print("\n=== Section 5: Module presence check ===")
 
 # ── section 6: reverse_search — searcher & request path ───────────────────────
 #
@@ -605,6 +603,139 @@ run_check("avg_sold_price is 0.0 when no sold listings exist", check_aggregate_n
 run_check("avg_listing_price is 0.0 when all listings are sold", check_aggregate_all_sold)
 run_check("empty input returns zero-valued PriceReport", check_aggregate_empty)
 run_check("currency is taken from the first listing", check_aggregate_currency_from_first_listing)
+
+# ── section 11: pipeline — run() and format_report() ─────────────────────────
+#
+# run() is tested offline using a mock ReverseSearchProvider so no network call
+# is made. format_report() is tested against a hand-built PriceReport.
+#
+# MOCK PROVIDER returns the same _FIXTURE dict used in Section 7, which after
+# parse() yields 2 valid listings (Amazon $29.99, eBay $24.50 — both active).
+# aggregate() produces:
+#   avg_listing_price = (24.50 + 29.99) / 2 = 27.245 → 27.25
+#   avg_sold_price    = 0.0   (no sold listings in fixture)
+#   sold_count        = 0
+#   listing_count     = 2
+
+print("\n=== Section 11: pipeline — run() and format_report() ===")
+
+from pipeline import run, format_report
+from models import PriceReport
+
+class _MockProvider:
+    """Returns the Section 7 fixture so run() can be tested without a network."""
+    def search(self, image):
+        return _FIXTURE
+
+
+def _mock_run(image_path: str) -> PriceReport:
+    """run() called with a real temp image and the mock provider."""
+    return run(image_path, _MockProvider())
+
+
+def check_pipeline_returns_price_report():
+    path = _make_jpeg()
+    report = _mock_run(path)
+    assert isinstance(report, PriceReport), f"expected PriceReport, got {type(report)}"
+
+
+def check_pipeline_listing_count():
+    path = _make_jpeg()
+    report = _mock_run(path)
+    assert report.listing_count == 2, f"expected 2 active listings, got {report.listing_count}"
+
+
+def check_pipeline_avg_listing_price():
+    path = _make_jpeg()
+    report = _mock_run(path)
+    expected = round((24.50 + 29.99) / 2, 2)
+    assert report.avg_listing_price == expected, (
+        f"expected avg_listing_price={expected}, got {report.avg_listing_price}"
+    )
+
+
+def check_pipeline_no_sold_listings():
+    path = _make_jpeg()
+    report = _mock_run(path)
+    assert report.sold_count == 0, f"expected sold_count=0, got {report.sold_count}"
+    assert report.avg_sold_price == 0.0, f"expected avg_sold_price=0.0, got {report.avg_sold_price}"
+
+
+def check_pipeline_listings_sorted():
+    path = _make_jpeg()
+    report = _mock_run(path)
+    prices = [l.price_value for l in report.listings]
+    assert prices == sorted(prices), f"listings not sorted ascending: {prices}"
+
+
+def check_pipeline_empty_provider():
+    """Provider returns no visual_matches → empty PriceReport."""
+    class _EmptyProvider:
+        def search(self, image):
+            return {}
+    path = _make_jpeg()
+    report = run(path, _EmptyProvider())
+    assert isinstance(report, PriceReport)
+    assert report.listing_count == 0 and report.sold_count == 0
+
+
+def check_format_report_contains_key_fields():
+    report = PriceReport(
+        listings=[],
+        avg_listing_price=27.25,
+        avg_sold_price=15.00,
+        sold_count=3,
+        listing_count=2,
+        currency="$",
+    )
+    output = format_report(report)
+    assert "27.25" in output, "avg listing price missing from format_report output"
+    assert "15.00" in output, "avg sold price missing from format_report output"
+    assert "3" in output, "sold_count missing from format_report output"
+    assert "2" in output, "listing_count missing from format_report output"
+
+
+def check_format_report_no_listings_message():
+    report = PriceReport(
+        listings=[],
+        avg_listing_price=0.0,
+        avg_sold_price=0.0,
+        sold_count=0,
+        listing_count=0,
+        currency="$",
+    )
+    output = format_report(report)
+    assert "No valid listings found" in output
+
+
+def check_format_report_sold_tag():
+    from datetime import datetime, timezone
+    sold_listing = ParsedListing(
+        title="Old Widget", url="https://ebay.com/itm/1",
+        source="eBay", price_raw="$10.00", price_value=10.0,
+        currency="$", sold_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    report = PriceReport(
+        listings=[sold_listing],
+        avg_listing_price=0.0,
+        avg_sold_price=10.0,
+        sold_count=1,
+        listing_count=0,
+        currency="$",
+    )
+    output = format_report(report)
+    assert "[sold]" in output, "sold tag missing for listing with sold_date"
+
+
+run_check("run() returns a PriceReport", check_pipeline_returns_price_report)
+run_check("run() listing_count matches valid fixture listings", check_pipeline_listing_count)
+run_check("run() avg_listing_price is mean of active prices", check_pipeline_avg_listing_price)
+run_check("run() reports zero sold when fixture has no sold listings", check_pipeline_no_sold_listings)
+run_check("run() listings are sorted ascending by price", check_pipeline_listings_sorted)
+run_check("run() with empty provider returns zero-valued PriceReport", check_pipeline_empty_provider)
+run_check("format_report() includes avg prices and counts", check_format_report_contains_key_fields)
+run_check("format_report() shows 'No valid listings found' when empty", check_format_report_no_listings_message)
+run_check("format_report() shows [sold] tag for sold listings", check_format_report_sold_tag)
 
 # ── summary ───────────────────────────────────────────────────────────────────
 
