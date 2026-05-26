@@ -2,11 +2,10 @@
 Autonomous code review agent using Claude API.
 
 Usage:
-    python src/agent_review.py [--target src/] [--browser URL]
+    python agent_review.py [--target .] [--browser URL]
 
-Runs four passes — security, compatibility, scalability, tests — then
-optionally verifies a running web endpoint in a headless browser via
-Playwright. Outputs a structured JSON report to stdout (or --output file).
+Runs five passes — security, compatibility, scalability, tests, browser (optional) —
+across the entire project. Outputs a structured JSON report to stdout (or --output file).
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent
 
 # ── tool schema definitions sent to Claude ─────────────────────────────────────
 
@@ -30,7 +29,7 @@ TOOLS: list[dict] = [
     {
         "name": "read_source_file",
         "description": (
-            "Read a Python source file from the project. "
+            "Read any Python source file from the project. "
             "Use to inspect code for compatibility and contract issues."
         ),
         "input_schema": {
@@ -38,7 +37,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to project root, e.g. 'src/image_processor.py'",
+                    "description": "Path relative to project root, e.g. 'src/image_processor.py' or 'agent_review.py'",
                 }
             },
             "required": ["path"],
@@ -55,7 +54,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Path relative to project root, e.g. 'src/' or 'src/reverse_search.py'",
+                    "description": "Path relative to project root, e.g. '.' for everything or 'src/' for pipeline only",
                 }
             },
             "required": ["target"],
@@ -82,7 +81,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to project root, e.g. 'src/reverse_search.py'",
+                    "description": "Path relative to project root, e.g. 'src/reverse_search.py' or 'agent_review.py'",
                 }
             },
             "required": ["path"],
@@ -183,7 +182,6 @@ def _tool_scan_scalability(path: str) -> str:
 
         def visit_Call(self, node: ast.Call) -> None:
             func = node.func
-            # Flag sync httpx.Client — blocks thread under async load
             if (
                 isinstance(func, ast.Attribute)
                 and func.attr == "Client"
@@ -268,19 +266,32 @@ def dispatch(name: str, tool_input: dict) -> str:
 
 _SYSTEM = """\
 You are an autonomous code review agent for the product-vision-matcher project —
-a Python pipeline: image_processor → reverse_search → marketplace_parser.
+a Python pipeline that takes a product image, reverse-searches it via SerpAPI Google Lens,
+parses marketplace listings, and ranks them by price.
+
+Project layout:
+  agent_review.py          ← this file (project root)
+  src/models.py            ← shared dataclasses: ProcessedImage, ParsedListing, ReverseSearchProvider
+  src/image_processor.py   ← validate/resize/encode images → ProcessedImage
+  src/reverse_search.py    ← SerpApiSearcher (httpx, injectable) → raw dict
+  src/marketplace_parser.py ← parse/filter listings → list[ParsedListing]
+  src/price_aggregator.py  ← rank_by_price → sorted list
+  src/pipeline.py          ← orchestration stub (empty)
+  src/test_setup.py        ← plain-Python test suite (no framework)
 
 Run these passes in order, calling tools as needed:
 
-1. SECURITY     — run_bandit on 'src/', then run_pip_audit
-2. COMPATIBILITY — read_source_file each module and verify data contracts:
-                   ProcessedImage must flow unchanged from image_processor
-                   into reverse_search, and the raw dict from reverse_search
-                   must match what marketplace_parser.parse() expects
-3. SCALABILITY  — scan_scalability on every .py in src/
-4. TESTS        — run_tests; confirm the suite is green
-5. BROWSER      — browser_check_url only if the user message includes a URL;
-                   skip otherwise
+1. SECURITY      — run_bandit on '.', then run_pip_audit.
+                   Report all HIGH/MEDIUM findings; include INFO only if notable.
+2. COMPATIBILITY — read_source_file for each module in src/ AND agent_review.py.
+                   Verify data contracts: ProcessedImage flows unchanged into reverse_search;
+                   the raw dict from reverse_search matches what marketplace_parser.parse() expects;
+                   ParsedListing flows into price_aggregator.rank_by_price.
+                   Flag any mismatches, missing fields, or type inconsistencies.
+3. SCALABILITY   — scan_scalability on every .py in src/ and on agent_review.py.
+                   Flag sync blocking calls and unbounded loops.
+4. TESTS         — run_tests; confirm the suite is green. Report passed/failed counts.
+5. BROWSER       — browser_check_url only if the user message includes a URL; skip otherwise.
 
 After all passes, output ONLY a JSON object (no prose before or after):
 {
@@ -294,10 +305,10 @@ After all passes, output ONLY a JSON object (no prose before or after):
 """
 
 
-def run_agent(target_dir: str = "src/", browser_url: str | None = None) -> dict:
+def run_agent(target_dir: str = ".", browser_url: str | None = None) -> dict:
     client = anthropic.Anthropic()
 
-    user_msg = f"Review the code under '{target_dir}'."
+    user_msg = f"Review the entire project. Target: '{target_dir}'."
     if browser_url:
         user_msg += f" Also run browser_check_url on: {browser_url}"
 
@@ -348,7 +359,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Autonomous code review agent (security · compatibility · scalability)"
     )
-    parser.add_argument("--target", default="src/", help="Directory or file to review (default: src/)")
+    parser.add_argument("--target", default=".", help="Directory or file to review (default: . for whole project)")
     parser.add_argument(
         "--browser", metavar="URL", default=None,
         help="Live HTTP/HTTPS URL to audit in headless Chromium after static checks",

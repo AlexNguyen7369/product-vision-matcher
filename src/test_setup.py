@@ -372,6 +372,12 @@ run_check("_is_within_12_months accepts date 10 days ago", check_is_within_12_mo
 
 print("\n=== Section 8: agent_review — tool implementations ===")
 
+# agent_review.py lives at the project root, not in src/ — add root to sys.path
+import pathlib as _pl
+_proj_root = str(_pl.Path(__file__).parent.parent)
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
+
 def _import_agent():
     import agent_review as _ar
     return _ar

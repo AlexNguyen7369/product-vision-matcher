@@ -42,6 +42,8 @@ The goal is a pipeline that takes a product image, reverse-searches it via Googl
 - `faiss-cpu`, `transformers`, and `torch` are installed for local embedding/similarity search (not yet wired into the pipeline — `reverse_search.py` via SerpAPI is the current approach).
 - `easyocr` is available for extracting text from product label images.
 
+- `agent_review.py` lives at the **project root** (not inside `src/`). Run it with `python agent_review.py` from the project root. It reviews the entire codebase — security, compatibility, scalability, and tests.
+
 **Current state:** `image_processor.py`, `reverse_search.py`, `marketplace_parser.py`, and `price_aggregator.py` (`rank_by_price`) are implemented. `pipeline.py` is the only remaining stub.
 
 ## Git Commit Policy
