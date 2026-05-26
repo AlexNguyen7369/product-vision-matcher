@@ -208,12 +208,48 @@ def check_rs_upload_failure_raises():
     except RuntimeError:
         pass
 
+def check_rs_pagination_merges_pages():
+    """Two SerpAPI pages are merged into a single visual_matches list."""
+    page_calls = [0]
+    def handler(request):
+        if request.url.host != "serpapi.com":
+            return httpx.Response(200, text="https://litter.catbox.moe/test.png")
+        idx = page_calls[0]
+        page_calls[0] += 1
+        if idx == 0:
+            return httpx.Response(200, json={
+                "visual_matches": [{"position": 1, "title": "A"}],
+                "serpapi_pagination": {"next": "https://serpapi.com/search.json?page=2"},
+            })
+        return httpx.Response(200, json={"visual_matches": [{"position": 21, "title": "B"}]})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    searcher = SerpApiSearcher(api_key="dummy", client=client, max_pages=2)
+    result = searcher.search(_tiny_image())
+    assert len(result.get("visual_matches", [])) == 2, \
+        f"expected 2 merged matches, got {len(result.get('visual_matches', []))}"
+
+def check_rs_single_page_when_no_next():
+    """When serpapi_pagination.next is absent, only one page is fetched."""
+    page_calls = [0]
+    def handler(request):
+        if request.url.host != "serpapi.com":
+            return httpx.Response(200, text="https://litter.catbox.moe/test.png")
+        page_calls[0] += 1
+        return httpx.Response(200, json={"visual_matches": [{"position": 1, "title": "A"}]})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    searcher = SerpApiSearcher(api_key="dummy", client=client, max_pages=3)
+    result = searcher.search(_tiny_image())
+    assert len(result.get("visual_matches", [])) == 1
+    assert page_calls[0] == 1, f"expected 1 SerpAPI call, got {page_calls[0]}"
+
 run_check("reverse_search exposes SerpApiSearcher", check_rs_import)
 run_check("_validate_key raises EnvironmentError when key is empty", check_rs_missing_key_raises)
 run_check("_validate_key passes when key is present", check_rs_key_present_does_not_raise)
 run_check("search() upload-then-search flow returns parsed JSON via MockTransport", check_rs_search_returns_json_offline)
 run_check("search() raises RuntimeError on non-200 SerpAPI response", check_rs_non_200_raises_offline)
 run_check("search() raises RuntimeError on upload failure", check_rs_upload_failure_raises)
+run_check("search() merges two pages of visual_matches via pagination", check_rs_pagination_merges_pages)
+run_check("search() fetches only one page when serpapi_pagination.next is absent", check_rs_single_page_when_no_next)
 
 # ── section 7: marketplace_parser — filter, extraction & sort ─────────────────
 #
@@ -385,6 +421,97 @@ run_check("_parse_date returns None for unparseable strings", check_parse_date_i
 run_check("_is_within_12_months(None) returns True", check_is_within_12_months_none)
 run_check("_is_within_12_months rejects date > 365 days ago", check_is_within_12_months_old)
 run_check("_is_within_12_months accepts date 10 days ago", check_is_within_12_months_recent)
+
+# ── section 7b: marketplace_parser — similarity scoring ──────────────────────
+#
+# _score() uses SerpAPI position (1 = best visual match) to produce a 1-10 score.
+# Uses a separate fixture with explicit position values so scoring checks are
+# independent of _FIXTURE (which is shared with Sections 9 and 11).
+#
+# SCORE_FIXTURE:
+#   [0] position=1  Amazon $20 -> score 10 (best match)
+#   [1] position=90 eBay   $20 -> score 5  (mid-range)
+#
+# INDEX_FIXTURE: no position field -> fallback to list index
+#   [0] index 0 -> higher score than [1] index 1
+
+from marketplace_parser import _score
+
+_SCORE_FIXTURE = {
+    "visual_matches": [
+        {
+            "title": "High Sim Widget", "link": "https://www.amazon.com/dp/B100",
+            "source": "Amazon",
+            "price": {"value": "$20.00", "extracted_value": 20.0, "currency": "$"},
+            "position": 1,
+        },
+        {
+            "title": "Low Sim Widget", "link": "https://www.ebay.com/itm/99999",
+            "source": "eBay",
+            "price": {"value": "$20.00", "extracted_value": 20.0, "currency": "$"},
+            "position": 90,
+        },
+    ]
+}
+
+_INDEX_FIXTURE = {
+    "visual_matches": [
+        {
+            "title": "First Match", "link": "https://www.amazon.com/dp/B200",
+            "source": "Amazon",
+            "price": {"value": "$30.00", "extracted_value": 30.0, "currency": "$"},
+        },
+        {
+            "title": "Second Match", "link": "https://www.ebay.com/itm/88888",
+            "source": "eBay",
+            "price": {"value": "$30.00", "extracted_value": 30.0, "currency": "$"},
+        },
+    ]
+}
+
+def check_score_top_position_is_10():
+    score = _score({"position": 1}, 0)
+    assert score == 10, f"position 1 should score 10, got {score}"
+
+def check_score_last_position_is_1():
+    score = _score({"position": 180}, 0)
+    assert score == 1, f"position 180 should score 1, got {score}"
+
+def check_score_reflects_position_order():
+    results = parse(_SCORE_FIXTURE)
+    high = next(r for r in results if "High" in r.title)
+    low  = next(r for r in results if "Low"  in r.title)
+    assert high.similarity_score > low.similarity_score, (
+        f"position-1 entry should outscore position-90: {high.similarity_score} vs {low.similarity_score}"
+    )
+
+def check_score_in_range():
+    results = parse(_SCORE_FIXTURE)
+    for r in results:
+        assert 1 <= r.similarity_score <= 10, f"score out of range: {r.similarity_score}"
+
+def check_score_index_fallback():
+    results = parse(_INDEX_FIXTURE)
+    assert len(results) == 2
+    first  = next(r for r in results if "First"  in r.title)
+    second = next(r for r in results if "Second" in r.title)
+    assert first.similarity_score >= second.similarity_score, (
+        f"index-0 entry should score >= index-1: {first.similarity_score} vs {second.similarity_score}"
+    )
+
+def check_default_similarity_score():
+    listing = ParsedListing(
+        title="x", url="https://amazon.com", source="Amazon",
+        price_raw="$10", price_value=10.0, currency="$",
+    )
+    assert listing.similarity_score == 1, "default similarity_score must be 1"
+
+run_check("score: position 1 maps to 10", check_score_top_position_is_10)
+run_check("score: position 180 maps to 1", check_score_last_position_is_1)
+run_check("score: lower position entry scores higher than higher position", check_score_reflects_position_order)
+run_check("score: all values in [1, 10]", check_score_in_range)
+run_check("score: fallback to list index when position absent", check_score_index_fallback)
+run_check("ParsedListing default similarity_score is 1", check_default_similarity_score)
 
 # ── section 8: agent_review — tool unit tests ─────────────────────────────────
 #
@@ -732,6 +859,25 @@ def check_format_report_no_listings_message():
     assert "No valid listings found" in output
 
 
+def check_format_report_shows_similarity():
+    from datetime import datetime, timezone
+    listing = ParsedListing(
+        title="Widget", url="https://amazon.com/dp/1",
+        source="Amazon", price_raw="$10.00", price_value=10.0,
+        currency="$", similarity_score=8,
+    )
+    report = PriceReport(
+        listings=[listing],
+        avg_listing_price=10.0,
+        avg_sold_price=0.0,
+        sold_count=0,
+        listing_count=1,
+        currency="$",
+    )
+    output = format_report(report)
+    assert "8/10" in output, "similarity score column missing from format_report output"
+
+
 def check_format_report_sold_tag():
     from datetime import datetime, timezone
     sold_listing = ParsedListing(
@@ -759,6 +905,7 @@ run_check("run() listings are sorted ascending by price", check_pipeline_listing
 run_check("run() with empty provider returns zero-valued PriceReport", check_pipeline_empty_provider)
 run_check("format_report() includes avg prices and counts", check_format_report_contains_key_fields)
 run_check("format_report() shows 'No valid listings found' when empty", check_format_report_no_listings_message)
+run_check("format_report() shows similarity score column (N/10)", check_format_report_shows_similarity)
 run_check("format_report() shows [sold] tag for sold listings", check_format_report_sold_tag)
 
 # ── summary ───────────────────────────────────────────────────────────────────

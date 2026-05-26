@@ -19,7 +19,8 @@ class ParsedListing:
     price_raw:   str            # original price string "$29.99" — preserved for display
     price_value: float          # machine-readable float 29.99 — used for ranking
     currency:    str            # currency symbol "$"
-    sold_date:   datetime | None = field(default=None)  # parsed from SerpAPI "date" field; None = active listing
+    sold_date:        datetime | None = field(default=None)  # parsed from SerpAPI "date" field; None = active listing
+    similarity_score: int          = field(default=1)     # 1 (weakest) – 10 (best visual match), from SerpAPI position
 
 
 @dataclass

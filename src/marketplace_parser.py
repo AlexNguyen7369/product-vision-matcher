@@ -18,17 +18,41 @@ _DATE_FORMATS = (
 
 _RELATIVE_RE = re.compile(r"(\d+)\s+(day|week|month|year)s?\s+ago", re.IGNORECASE)
 
+# Scoring scale: covers 3 pages of Google Lens results (up to ~180 matches).
+# position 1 -> score 10, position 180 -> score 1, clamped to [1, 10].
+_MAX_POSITION = 180
+
 
 def parse(serpapi_response: dict) -> list[ParsedListing]:
-    """Extract and filter marketplace listings from a SerpAPI response.
+    """Extract, score, and filter marketplace listings from a SerpAPI response.
 
-    Returns listings in source order. Ranking/ordering is intentionally left
-    to price_aggregator — the parser decides which listings are valid, the
-    aggregator decides how to present them.
+    Scoring and filtering are separate concerns:
+      - _score() assigns a 1-10 similarity score from SerpAPI position.
+      - _passes_filter() applies four hard gates unchanged from the original design.
+    Returned listings are in source order; ranking is left to price_aggregator.
     """
     raw_matches = serpapi_response.get("visual_matches", [])
-    candidates = list(filter(None, (_extract(m) for m in raw_matches)))
-    return [listing for listing in candidates if _passes_filter(listing)]
+    results = []
+    for index, match in enumerate(raw_matches):
+        listing = _extract(match)
+        if listing is None:
+            continue
+        listing.similarity_score = _score(match, index)
+        if _passes_filter(listing):
+            results.append(listing)
+    return results
+
+
+def _score(match: dict, index: int) -> int:
+    """Map SerpAPI position to a 1-10 visual similarity score.
+
+    position 1 (top Google Lens result) -> 10
+    position _MAX_POSITION              -> 1
+    Falls back to list index+1 when position is absent (older fixtures omit it).
+    """
+    position = match.get("position") or (index + 1)
+    score = 10 - round((position - 1) / (_MAX_POSITION - 1) * 9)
+    return max(1, min(10, score))
 
 
 def _extract(match: dict) -> ParsedListing | None:

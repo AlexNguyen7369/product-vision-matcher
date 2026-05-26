@@ -37,7 +37,8 @@ def format_report(report: PriceReport) -> str:
         for listing in report.listings:
             tag = "[sold]" if listing.sold_date else "      "
             lines.append(
-                f"    {tag} {listing.price_raw:>8}  {listing.source:<12}  {listing.title}"
+                f"    {tag} sim {listing.similarity_score:>2}/10"
+                f"  {listing.price_raw:>8}  {listing.source:<12}  {listing.title}"
             )
     else:
         lines.append("  No valid listings found.")
