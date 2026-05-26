@@ -273,6 +273,99 @@ run_check("entry with no price block produces empty list", check_no_price_block_
 run_check("empty serpapi response returns empty list", check_empty_response)
 run_check("ParsedListing fields match fixture values", check_parsed_listing_fields)
 
+# ── section 8: agent_review — tool unit tests ─────────────────────────────────
+#
+# Tests the tool-implementation layer of agent_review without calling the
+# Claude API or hitting the network. Each function under test is imported
+# directly so the agent loop itself is never invoked.
+
+print("\n=== Section 8: agent_review — tool implementations ===")
+
+def _import_agent():
+    import agent_review as _ar
+    return _ar
+
+def check_ar_import():
+    _ar = _import_agent()
+    for symbol in ("run_agent", "dispatch", "TOOLS", "_tool_read_source_file",
+                   "_tool_scan_scalability", "_tool_browser_check_url"):
+        assert hasattr(_ar, symbol), f"missing: {symbol}"
+
+def check_read_existing_file():
+    _ar = _import_agent()
+    content = _ar._tool_read_source_file("src/image_processor.py")
+    assert "ProcessedImage" in content, "expected ProcessedImage in image_processor.py"
+
+def check_read_missing_file():
+    _ar = _import_agent()
+    result = _ar._tool_read_source_file("src/does_not_exist.py")
+    assert result.startswith("ERROR:"), f"expected ERROR prefix, got: {result[:60]}"
+
+def check_scan_scalability_finds_httpx():
+    _ar = _import_agent()
+    result = _ar._tool_scan_scalability("src/reverse_search.py")
+    assert isinstance(result, str), "scan_scalability must return a string"
+    assert "httpx" in result.lower() or "Client" in result, (
+        "expected a sync httpx.Client finding in reverse_search.py"
+    )
+
+def check_scan_scalability_missing_file():
+    _ar = _import_agent()
+    result = _ar._tool_scan_scalability("src/does_not_exist.py")
+    assert result.startswith("ERROR:"), f"expected ERROR prefix, got: {result[:60]}"
+
+def check_scan_scalability_clean_file():
+    _ar = _import_agent()
+    result = _ar._tool_scan_scalability("src/marketplace_parser.py")
+    assert isinstance(result, str)
+    # marketplace_parser.py has no httpx or while-True — should be clean
+    assert "No scalability concerns" in result or "!" not in result
+
+def check_dispatch_unknown_tool():
+    _ar = _import_agent()
+    result = _ar.dispatch("nonexistent_tool", {})
+    assert result.startswith("ERROR:"), f"expected ERROR prefix, got: {result[:60]}"
+
+def check_browser_rejects_bad_scheme():
+    _ar = _import_agent()
+    result = _ar._tool_browser_check_url("javascript:void(0)")
+    assert result.startswith("ERROR:"), f"expected ERROR for bad URL scheme, got: {result[:60]}"
+
+def check_browser_rejects_relative_url():
+    _ar = _import_agent()
+    result = _ar._tool_browser_check_url("/local/path")
+    assert result.startswith("ERROR:"), f"expected ERROR for relative URL, got: {result[:60]}"
+
+def check_tools_list_has_required_entries():
+    _ar = _import_agent()
+    names = {t["name"] for t in _ar.TOOLS}
+    for required in ("read_source_file", "run_bandit", "run_pip_audit",
+                     "run_tests", "scan_scalability", "browser_check_url"):
+        assert required in names, f"TOOLS missing entry: {required}"
+
+def check_bandit_returns_string():
+    _ar = _import_agent()
+    result = _ar._tool_run_bandit("src/")
+    assert isinstance(result, str) and len(result) > 0
+
+def check_pip_audit_returns_string():
+    _ar = _import_agent()
+    result = _ar._tool_run_pip_audit()
+    assert isinstance(result, str) and len(result) > 0
+
+run_check("agent_review imports with expected public surface", check_ar_import)
+run_check("read_source_file returns content for existing file", check_read_existing_file)
+run_check("read_source_file returns ERROR for missing file", check_read_missing_file)
+run_check("scan_scalability flags sync httpx.Client in reverse_search.py", check_scan_scalability_finds_httpx)
+run_check("scan_scalability returns ERROR for missing file", check_scan_scalability_missing_file)
+run_check("scan_scalability reports clean for marketplace_parser.py", check_scan_scalability_clean_file)
+run_check("dispatch returns ERROR for unknown tool name", check_dispatch_unknown_tool)
+run_check("browser_check_url rejects javascript: scheme", check_browser_rejects_bad_scheme)
+run_check("browser_check_url rejects relative path", check_browser_rejects_relative_url)
+run_check("TOOLS list contains all six required entries", check_tools_list_has_required_entries)
+run_check("run_bandit returns a non-empty string", check_bandit_returns_string)
+run_check("run_pip_audit returns a non-empty string", check_pip_audit_returns_string)
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 print(f"\n{'='*40}")
