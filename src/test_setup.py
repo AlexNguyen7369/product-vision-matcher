@@ -495,6 +495,111 @@ run_check("rank_by_price does not mutate its input", check_rank_does_not_mutate_
 run_check("rank_by_price handles empty list", check_rank_empty_list)
 run_check("parse() then rank_by_price yields ascending prices", check_parse_then_rank_is_ascending)
 
+# ── section 10: price_aggregator — aggregate() ────────────────────────────────
+#
+# FIXTURES:
+#   active_a  — $20.00, no sold_date  (active listing)
+#   active_b  — $30.00, no sold_date  (active listing)
+#   sold_a    — $15.00, sold_date set (completed sale)
+#   sold_b    — $25.00, sold_date set (completed sale)
+#
+# Expected:
+#   avg_listing_price = (20 + 30) / 2 = 25.00
+#   avg_sold_price    = (15 + 25) / 2 = 20.00
+#   sold_count        = 2
+#   listing_count     = 2
+#   listings sorted   = [15.00, 20.00, 25.00, 30.00]
+
+print("\n=== Section 10: price_aggregator — aggregate() ===")
+
+from datetime import datetime, timezone
+from price_aggregator import aggregate
+from models import PriceReport
+
+_SOLD_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+def _active(price: float) -> ParsedListing:
+    return ParsedListing(
+        title="x", url="https://amazon.com", source="Amazon",
+        price_raw=f"${price}", price_value=price, currency="$",
+        sold_date=None,
+    )
+
+def _sold(price: float) -> ParsedListing:
+    return ParsedListing(
+        title="x", url="https://amazon.com", source="Amazon",
+        price_raw=f"${price}", price_value=price, currency="$",
+        sold_date=_SOLD_DATE,
+    )
+
+_MIX = [_active(20.00), _active(30.00), _sold(15.00), _sold(25.00)]
+
+def check_aggregate_returns_price_report():
+    report = aggregate(_MIX)
+    assert isinstance(report, PriceReport), f"expected PriceReport, got {type(report)}"
+
+def check_aggregate_avg_listing_price():
+    report = aggregate(_MIX)
+    assert report.avg_listing_price == 25.00, \
+        f"avg_listing_price: expected 25.00, got {report.avg_listing_price}"
+
+def check_aggregate_avg_sold_price():
+    report = aggregate(_MIX)
+    assert report.avg_sold_price == 20.00, \
+        f"avg_sold_price: expected 20.00, got {report.avg_sold_price}"
+
+def check_aggregate_sold_count():
+    report = aggregate(_MIX)
+    assert report.sold_count == 2, f"sold_count: expected 2, got {report.sold_count}"
+
+def check_aggregate_listing_count():
+    report = aggregate(_MIX)
+    assert report.listing_count == 2, f"listing_count: expected 2, got {report.listing_count}"
+
+def check_aggregate_listings_sorted():
+    report = aggregate(_MIX)
+    prices = [l.price_value for l in report.listings]
+    assert prices == sorted(prices), f"listings not sorted ascending: {prices}"
+
+def check_aggregate_no_sold_listings():
+    report = aggregate([_active(10.00), _active(20.00)])
+    assert report.avg_sold_price == 0.0, "avg_sold_price must be 0.0 when no sold listings"
+    assert report.sold_count == 0
+
+def check_aggregate_all_sold():
+    report = aggregate([_sold(10.00), _sold(20.00)])
+    assert report.avg_listing_price == 0.0, "avg_listing_price must be 0.0 when all are sold"
+    assert report.listing_count == 0
+
+def check_aggregate_empty():
+    report = aggregate([])
+    assert report.avg_listing_price == 0.0
+    assert report.avg_sold_price == 0.0
+    assert report.sold_count == 0
+    assert report.listing_count == 0
+    assert report.listings == []
+    assert report.currency == "$"
+
+def check_aggregate_currency_from_first_listing():
+    listings = [_active(10.00)]
+    listings[0] = ParsedListing(
+        title="x", url="https://amazon.com", source="Amazon",
+        price_raw="€10", price_value=10.0, currency="€",
+    )
+    report = aggregate(listings)
+    assert report.currency == "€", f"expected €, got {report.currency}"
+
+run_check("aggregate() returns a PriceReport instance", check_aggregate_returns_price_report)
+run_check("avg_listing_price is mean of active-only listings", check_aggregate_avg_listing_price)
+run_check("avg_sold_price is mean of sold-only listings", check_aggregate_avg_sold_price)
+run_check("sold_count matches number of listings with sold_date", check_aggregate_sold_count)
+run_check("listing_count matches number of active (unsold) listings", check_aggregate_listing_count)
+run_check("PriceReport.listings is sorted ascending by price", check_aggregate_listings_sorted)
+run_check("avg_sold_price is 0.0 when no sold listings exist", check_aggregate_no_sold_listings)
+run_check("avg_listing_price is 0.0 when all listings are sold", check_aggregate_all_sold)
+run_check("empty input returns zero-valued PriceReport", check_aggregate_empty)
+run_check("currency is taken from the first listing", check_aggregate_currency_from_first_listing)
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 print(f"\n{'='*40}")
