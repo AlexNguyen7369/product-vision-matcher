@@ -309,10 +309,10 @@ def check_all_results_are_parsed_listing():
     for r in results:
         assert isinstance(r, ParsedListing), f"expected ParsedListing, got {type(r)}"
 
-def check_non_marketplace_filtered():
+def check_no_price_block_source_dropped():
     results = parse(_FIXTURE)
     sources = {r.source for r in results}
-    assert "Blogger" not in sources, "non-marketplace source leaked through filter"
+    assert "Blogger" not in sources, "entry with no price block should not appear in results"
 
 def check_zero_price_filtered():
     results = parse(_FIXTURE)
@@ -339,7 +339,7 @@ def check_parsed_listing_fields():
 
 run_check("only 2 of 5 fixtures survive filter", check_returns_only_valid_listings)
 run_check("all results are ParsedListing instances", check_all_results_are_parsed_listing)
-run_check("non-marketplace source (Blogger) filtered out", check_non_marketplace_filtered)
+run_check("entry with no price block (Blogger) dropped in extract", check_no_price_block_source_dropped)
 run_check("zero-price entry filtered out", check_zero_price_filtered)
 run_check("javascript: URL filtered out", check_bad_url_scheme_filtered)
 run_check("entry with no price block produces empty list", check_no_price_block_dropped)

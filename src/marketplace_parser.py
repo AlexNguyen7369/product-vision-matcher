@@ -3,11 +3,6 @@ import re
 from datetime import datetime, timedelta, timezone
 from models import ParsedListing
 
-MARKETPLACE_SOURCES = {
-    "amazon", "ebay", "walmart", "etsy",
-    "target", "bestbuy", "newegg", "wayfair",
-}
-
 _DATE_FORMATS = (
     "%Y-%m-%d",
     "%b %d, %Y",
@@ -79,13 +74,10 @@ def _extract(match: dict) -> ParsedListing | None:
 
 
 def _passes_filter(listing: ParsedListing) -> bool:
-    is_known_marketplace = any(
-        known in listing.source.lower() for known in MARKETPLACE_SOURCES
-    )
     has_valid_price = listing.price_value > 0
     has_valid_url   = listing.url.startswith(("http://", "https://"))
     is_recent       = _is_within_12_months(listing.sold_date)
-    return is_known_marketplace and has_valid_price and has_valid_url and is_recent
+    return has_valid_price and has_valid_url and is_recent
 
 
 def _is_within_12_months(sold_date: datetime | None) -> bool:
