@@ -166,17 +166,29 @@ def check_rs_missing_key_raises():
 def check_rs_key_present_does_not_raise():
     SerpApiSearcher(api_key="dummy-key-for-test")._validate_key()  # should not raise
 
-def check_rs_search_returns_json_offline():
+def _two_step_handler(serpapi_response: dict):
+    """MockTransport handler for the upload-then-search two-request flow.
+
+    POST to catbox host  -> returns a fake public URL string.
+    GET  to serpapi host -> returns the given JSON dict.
+    """
     def handler(request):
-        return httpx.Response(200, json={"visual_matches": []})
-    client = httpx.Client(transport=httpx.MockTransport(handler))
+        if request.url.host == "serpapi.com":
+            return httpx.Response(200, json=serpapi_response)
+        return httpx.Response(200, text="https://litter.catbox.moe/test.png")
+    return handler
+
+def check_rs_search_returns_json_offline():
+    client = httpx.Client(transport=httpx.MockTransport(_two_step_handler({"visual_matches": []})))
     searcher = SerpApiSearcher(api_key="dummy", client=client)
     result = searcher.search(_tiny_image())
     assert result == {"visual_matches": []}, f"unexpected payload: {result}"
 
 def check_rs_non_200_raises_offline():
     def handler(request):
-        return httpx.Response(500, text="upstream error")
+        if request.url.host == "serpapi.com":
+            return httpx.Response(500, text="upstream error")
+        return httpx.Response(200, text="https://litter.catbox.moe/test.png")
     client = httpx.Client(transport=httpx.MockTransport(handler))
     searcher = SerpApiSearcher(api_key="dummy", client=client)
     try:
@@ -185,11 +197,23 @@ def check_rs_non_200_raises_offline():
     except RuntimeError:
         pass
 
+def check_rs_upload_failure_raises():
+    def handler(request):
+        return httpx.Response(503, text="service unavailable")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    searcher = SerpApiSearcher(api_key="dummy", client=client)
+    try:
+        searcher.search(_tiny_image())
+        raise AssertionError("expected RuntimeError on upload failure, got none")
+    except RuntimeError:
+        pass
+
 run_check("reverse_search exposes SerpApiSearcher", check_rs_import)
 run_check("_validate_key raises EnvironmentError when key is empty", check_rs_missing_key_raises)
 run_check("_validate_key passes when key is present", check_rs_key_present_does_not_raise)
-run_check("search() returns parsed JSON via MockTransport", check_rs_search_returns_json_offline)
-run_check("search() raises RuntimeError on non-200 via MockTransport", check_rs_non_200_raises_offline)
+run_check("search() upload-then-search flow returns parsed JSON via MockTransport", check_rs_search_returns_json_offline)
+run_check("search() raises RuntimeError on non-200 SerpAPI response", check_rs_non_200_raises_offline)
+run_check("search() raises RuntimeError on upload failure", check_rs_upload_failure_raises)
 
 # ── section 7: marketplace_parser — filter, extraction & sort ─────────────────
 #

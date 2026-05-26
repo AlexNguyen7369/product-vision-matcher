@@ -25,12 +25,12 @@ def format_report(report: PriceReport) -> str:
     """Return a human-readable summary of a PriceReport."""
     c = report.currency
     lines = [
-        "─" * 44,
+        "-" * 44,
         f"  Active listings  : {report.listing_count}",
         f"  Avg listing price: {c}{report.avg_listing_price:.2f}",
         f"  Sold listings    : {report.sold_count}",
         f"  Avg sold price   : {c}{report.avg_sold_price:.2f}",
-        "─" * 44,
+        "-" * 44,
     ]
     if report.listings:
         lines.append("  All listings (cheapest first):")

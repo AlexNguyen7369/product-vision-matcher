@@ -5,7 +5,8 @@ import httpx
 from dotenv import load_dotenv
 from models import ProcessedImage
 
-_SERPAPI_URL = "https://serpapi.com/search"
+_SERPAPI_URL = "https://serpapi.com/search.json"
+_CATBOX_URL  = "https://litterbox.catbox.moe/resources/internals/api.php"
 _DEFAULT_TIMEOUT = 30.0
 
 
@@ -21,6 +22,11 @@ class SerpApiSearcher:
     and HTTP client are injected through the constructor rather than read from
     module-level globals, so the searcher can be configured per-instance and
     unit-tested offline (pass an httpx.Client built on httpx.MockTransport).
+
+    SerpAPI Google Lens only accepts image URLs, not direct file uploads.
+    search() therefore first uploads the image to a temporary public host
+    (litterbox.catbox.moe, 72-hour retention, no auth required), then passes
+    the returned URL to SerpAPI.
     """
 
     def __init__(
@@ -36,13 +42,13 @@ class SerpApiSearcher:
         self._timeout = timeout
 
     def search(self, image: ProcessedImage) -> dict:
-        """Send a ProcessedImage to SerpAPI Google Lens and return the raw dict.
+        """Upload the image, search with Google Lens, return the raw response dict.
 
         The full SerpAPI payload is returned unchanged so marketplace_parser
         can inspect every field; nothing is discarded at the network boundary.
         """
         self._validate_key()
-        response = self._post(image)
+        response = self._search(image)
         self._check_response(response)
         return response.json()
 
@@ -50,18 +56,32 @@ class SerpApiSearcher:
         if not self._api_key:
             raise EnvironmentError("SERPAPI_KEY not set in .env")
 
-    def _post(self, image: ProcessedImage) -> httpx.Response:
+    def _upload(self, image: ProcessedImage) -> str:
+        """Upload image bytes to a temporary public host; return the public URL."""
         image_bytes = base64.b64decode(image.encoded)
         fmt = image.format.lower()
-        data = {"engine": "google_lens", "api_key": self._api_key}
-        files = {"image": (f"upload.{fmt}", image_bytes, f"image/{fmt}")}
+        resp = self._request("POST", _CATBOX_URL,
+            data={"reqtype": "fileupload", "time": "72h"},
+            files={"fileToUpload": (f"upload.{fmt}", image_bytes, f"image/{fmt}")},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Image upload failed ({resp.status_code}): {resp.text[:200]}")
+        url = resp.text.strip()
+        if not url.startswith("https://"):
+            raise RuntimeError(f"Unexpected upload response: {url[:200]}")
+        return url
 
-        # Reuse an injected client when provided (tests, connection pooling);
-        # otherwise open a short-lived client scoped to this single request.
+    def _search(self, image: ProcessedImage) -> httpx.Response:
+        url = self._upload(image)
+        params = {"engine": "google_lens", "api_key": self._api_key, "url": url}
+        return self._request("GET", _SERPAPI_URL, params=params)
+
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Issue an HTTP request, reusing an injected client when provided."""
         if self._client is not None:
-            return self._client.post(_SERPAPI_URL, data=data, files=files)
+            return self._client.request(method, url, **kwargs)
         with httpx.Client(timeout=self._timeout) as client:
-            return client.post(_SERPAPI_URL, data=data, files=files)
+            return client.request(method, url, **kwargs)
 
     @staticmethod
     def _check_response(response: httpx.Response) -> None:
