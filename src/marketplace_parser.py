@@ -1,10 +1,22 @@
 from __future__ import annotations
+import re
+from datetime import datetime, timedelta, timezone
 from models import ParsedListing
 
 MARKETPLACE_SOURCES = {
     "amazon", "ebay", "walmart", "etsy",
     "target", "bestbuy", "newegg", "wayfair",
 }
+
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%m/%d/%Y",
+    "%d %b %Y",
+)
+
+_RELATIVE_RE = re.compile(r"(\d+)\s+(day|week|month|year)s?\s+ago", re.IGNORECASE)
 
 
 def parse(serpapi_response: dict) -> list[ParsedListing]:
@@ -38,6 +50,7 @@ def _extract(match: dict) -> ParsedListing | None:
         price_raw   = price_block.get("value", ""),
         price_value = price_block.get("extracted_value", 0.0),
         currency    = price_block.get("currency", "$"),
+        sold_date   = _parse_date(match.get("date", "")),
     )
 
 
@@ -47,4 +60,44 @@ def _passes_filter(listing: ParsedListing) -> bool:
     )
     has_valid_price = listing.price_value > 0
     has_valid_url   = listing.url.startswith(("http://", "https://"))
-    return is_known_marketplace and has_valid_price and has_valid_url
+    is_recent       = _is_within_12_months(listing.sold_date)
+    return is_known_marketplace and has_valid_price and has_valid_url and is_recent
+
+
+def _is_within_12_months(sold_date: datetime | None) -> bool:
+    """Return True when sold_date is recent or unknown (None = no date on listing)."""
+    if sold_date is None:
+        return True
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=365)
+    return sold_date >= cutoff
+
+
+def _parse_date(date_str: str) -> datetime | None:
+    """Parse a SerpAPI date string into a UTC datetime, or None if unparseable.
+
+    Handles relative strings ("3 months ago"), ISO dates ("2024-01-15"),
+    and common US formats ("Jan 15, 2024").
+    """
+    if not date_str:
+        return None
+
+    m = _RELATIVE_RE.search(date_str)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        now = datetime.now(tz=timezone.utc)
+        if unit == "day":
+            return now - timedelta(days=n)
+        if unit == "week":
+            return now - timedelta(weeks=n)
+        if unit == "month":
+            return now - timedelta(days=n * 30)
+        if unit == "year":
+            return now - timedelta(days=n * 365)
+
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+    return None

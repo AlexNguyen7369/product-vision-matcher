@@ -205,7 +205,8 @@ run_check("search() raises RuntimeError on non-200 via MockTransport", check_rs_
 
 print("\n=== Section 7: marketplace_parser — filter, extraction & sort ===")
 
-from marketplace_parser import parse
+from datetime import datetime, timedelta, timezone
+from marketplace_parser import parse, _parse_date, _is_within_12_months
 
 _FIXTURE = {
     "visual_matches": [
@@ -286,6 +287,82 @@ run_check("javascript: URL filtered out", check_bad_url_scheme_filtered)
 run_check("entry with no price block produces empty list", check_no_price_block_dropped)
 run_check("empty serpapi response returns empty list", check_empty_response)
 run_check("ParsedListing fields match fixture values", check_parsed_listing_fields)
+
+# ── date filtering ────────────────────────────────────────────────────────────
+
+def _dated_match(date_str: str) -> dict:
+    return {
+        "title": "Test Item",
+        "link": "https://www.amazon.com/dp/B999",
+        "source": "Amazon",
+        "price": {"value": "$10.00", "extracted_value": 10.0, "currency": "$"},
+        "date": date_str,
+    }
+
+def check_old_listing_dropped():
+    old = datetime.now(tz=timezone.utc) - timedelta(days=400)
+    date_str = old.strftime("%Y-%m-%d")
+    result = parse({"visual_matches": [_dated_match(date_str)]})
+    assert result == [], f"listing older than 12 months should be dropped, got {result}"
+
+def check_recent_listing_kept():
+    recent = datetime.now(tz=timezone.utc) - timedelta(days=30)
+    date_str = recent.strftime("%Y-%m-%d")
+    result = parse({"visual_matches": [_dated_match(date_str)]})
+    assert len(result) == 1, f"listing from 30 days ago should be kept, got {result}"
+
+def check_no_date_listing_kept():
+    result = parse({"visual_matches": [_dated_match("")]})
+    assert len(result) == 1, "listing with no date should pass through (undated = unknown age)"
+
+def check_parse_date_iso():
+    d = _parse_date("2025-06-15")
+    assert isinstance(d, datetime), "ISO date string should parse to datetime"
+    assert d.year == 2025 and d.month == 6 and d.day == 15
+
+def check_parse_date_us_format():
+    d = _parse_date("Jan 15, 2025")
+    assert isinstance(d, datetime), "US date string should parse to datetime"
+    assert d.month == 1 and d.day == 15
+
+def check_parse_date_relative_months():
+    d = _parse_date("3 months ago")
+    assert isinstance(d, datetime), "relative date string should parse to datetime"
+    expected = datetime.now(tz=timezone.utc) - timedelta(days=90)
+    assert abs((d - expected).total_seconds()) < 5
+
+def check_parse_date_relative_year():
+    d = _parse_date("1 year ago")
+    assert isinstance(d, datetime)
+    expected = datetime.now(tz=timezone.utc) - timedelta(days=365)
+    assert abs((d - expected).total_seconds()) < 5
+
+def check_parse_date_invalid_returns_none():
+    assert _parse_date("not a date at all") is None
+    assert _parse_date("") is None
+
+def check_is_within_12_months_none():
+    assert _is_within_12_months(None) is True, "None sold_date should pass through"
+
+def check_is_within_12_months_old():
+    old = datetime.now(tz=timezone.utc) - timedelta(days=400)
+    assert _is_within_12_months(old) is False, "date > 12 months ago should fail"
+
+def check_is_within_12_months_recent():
+    recent = datetime.now(tz=timezone.utc) - timedelta(days=10)
+    assert _is_within_12_months(recent) is True, "date 10 days ago should pass"
+
+run_check("listing older than 12 months is dropped", check_old_listing_dropped)
+run_check("listing from 30 days ago is kept", check_recent_listing_kept)
+run_check("listing with no date passes through", check_no_date_listing_kept)
+run_check("_parse_date handles ISO format", check_parse_date_iso)
+run_check("_parse_date handles US month format", check_parse_date_us_format)
+run_check("_parse_date handles relative 'N months ago'", check_parse_date_relative_months)
+run_check("_parse_date handles relative '1 year ago'", check_parse_date_relative_year)
+run_check("_parse_date returns None for unparseable strings", check_parse_date_invalid_returns_none)
+run_check("_is_within_12_months(None) returns True", check_is_within_12_months_none)
+run_check("_is_within_12_months rejects date > 365 days ago", check_is_within_12_months_old)
+run_check("_is_within_12_months accepts date 10 days ago", check_is_within_12_months_recent)
 
 # ── section 8: agent_review — tool unit tests ─────────────────────────────────
 #
