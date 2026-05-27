@@ -165,6 +165,33 @@
       display: block;
     }
 
+    .change-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 4px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      display: none;
+      z-index: 10;
+      transition: background 0.15s;
+    }
+
+    .change-btn:hover {
+      background: rgba(0, 0, 0, 0.85);
+    }
+
+    .drop-zone.has-image .change-btn {
+      display: block;
+    }
+
     .btn {
       width: 100%;
       padding: 0.75rem 1rem;
@@ -427,9 +454,10 @@
 
   <main>
     <aside class="sidebar">
+      <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" style="display:none" />
       <div class="drop-zone" id="dropZone">
-        <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" />
         <img id="preview" alt="Preview" />
+        <button class="change-btn" id="changeBtn" type="button">Change</button>
         <div class="placeholder" style="display:flex;flex-direction:column;align-items:center;gap:0.75rem;">
           <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round"
@@ -486,6 +514,7 @@
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
     const preview = document.getElementById('preview');
+    const changeBtn = document.getElementById('changeBtn');
     const imageOverlay = document.getElementById('imageOverlay');
     const analyzeBtn = document.getElementById('analyzeBtn');
     const statusDot = document.getElementById('statusDot');
@@ -514,6 +543,18 @@
     fileInput.addEventListener('change', e => {
       const f = e.target.files[0];
       if (f) { selectedFile = f; showPreview(f); }
+      fileInput.value = ''; // reset so same file can be re-selected
+    });
+
+    // Change button opens file picker without triggering drop-zone click
+    changeBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      fileInput.click();
+    });
+
+    // Only open file picker on drop-zone click when no image is loaded
+    dropZone.addEventListener('click', e => {
+      if (!dropZone.classList.contains('has-image')) fileInput.click();
     });
 
     dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
