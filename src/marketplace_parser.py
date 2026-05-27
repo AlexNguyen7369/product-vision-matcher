@@ -5,7 +5,7 @@ from models import ParsedListing
 
 MARKETPLACE_SOURCES = {
     "amazon", "ebay", "walmart", "etsy",
-    "target", "bestbuy", "newegg", "wayfair",
+    "target", "bestbuy", "newegg", "wayfair", "shopkaraku", "mercari", "poshmark", "depop"
 }
 
 _DATE_FORMATS = (
