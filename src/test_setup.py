@@ -908,6 +908,433 @@ run_check("format_report() shows 'No valid listings found' when empty", check_fo
 run_check("format_report() shows similarity score column (N/10)", check_format_report_shows_similarity)
 run_check("format_report() shows [sold] tag for sold listings", check_format_report_sold_tag)
 
+# ── section 12: trending models — dataclass construction ─────────────────────
+
+print("\n=== Section 12: trending models — dataclass construction ===")
+
+from models import KeywordSignal, WatchSignal, SoldSignal, TrendingItem, TrendingProvider
+
+_NOW = datetime.now(tz=timezone.utc)
+
+def check_keyword_signal_fields():
+    k = KeywordSignal(item_id="123", keyword="widget", rank=1, fetched_at=_NOW)
+    assert k.item_id == "123" and k.rank == 1 and k.fetched_at == _NOW
+
+def check_watch_signal_fields():
+    w = WatchSignal(item_id="456", title="Gadget", watch_count=200, fetched_at=_NOW)
+    assert w.watch_count == 200
+
+def check_sold_signal_fields():
+    s = SoldSignal(
+        item_id="789", title="Gizmo", sold_count=40, total_count=50,
+        sold_rate=0.8, last_sold=_NOW, fetched_at=_NOW,
+    )
+    assert s.sold_rate == 0.8 and s.last_sold == _NOW
+
+def check_trending_item_fields():
+    it = TrendingItem(
+        item_id="1", title="T", url="https://x.com", source="eBay",
+        rank=1, score=4.5, keyword_rank=1, watch_count=100, sold_rate=0.5,
+        norm_keyword=1.0, norm_watch=0.8, norm_sold=0.6,
+    )
+    assert it.rank == 1 and it.score == 4.5
+
+def check_trending_item_optional_none():
+    it = TrendingItem(
+        item_id="2", title="T2", url="", source="eBay",
+        rank=2, score=1.0,
+        keyword_rank=None, watch_count=None, sold_rate=None,
+        norm_keyword=0.0, norm_watch=0.0, norm_sold=0.0,
+    )
+    assert it.keyword_rank is None and it.watch_count is None
+
+run_check("KeywordSignal constructs with correct fields", check_keyword_signal_fields)
+run_check("WatchSignal constructs with correct fields", check_watch_signal_fields)
+run_check("SoldSignal constructs with correct fields (including last_sold)", check_sold_signal_fields)
+run_check("TrendingItem constructs with all fields", check_trending_item_fields)
+run_check("TrendingItem accepts None for optional signal fields", check_trending_item_optional_none)
+
+# ── section 13: trending_scorer — normalization, filtering, and ranking ───────
+
+print("\n=== Section 13: trending_scorer — normalization, filtering, and ranking ===")
+
+import trending_scorer
+from trending_scorer import score_trending, _min_max, _passes_predicate, KEYWORD_WEIGHT, WATCH_WEIGHT, SOLD_WEIGHT
+
+def _kw(item_id, rank):
+    return KeywordSignal(item_id=item_id, keyword="x", rank=rank, fetched_at=_NOW)
+
+def _w(item_id, count, title=""):
+    return WatchSignal(item_id=item_id, title=title, watch_count=count, fetched_at=_NOW)
+
+def _s(item_id, sold_count, total_count, last_sold=None):
+    rate = sold_count / total_count if total_count > 0 else 0.0
+    return SoldSignal(
+        item_id=item_id, title="", sold_count=sold_count,
+        total_count=total_count, sold_rate=rate,
+        last_sold=last_sold or _NOW, fetched_at=_NOW,
+    )
+
+def check_min_max_basic():
+    result = _min_max([0.0, 50.0, 100.0])
+    assert result == [0.0, 0.5, 1.0], f"unexpected: {result}"
+
+def check_min_max_all_equal():
+    result = _min_max([5.0, 5.0, 5.0])
+    assert result == [1.0, 1.0, 1.0], f"all-equal should be 1.0: {result}"
+
+def check_min_max_with_none():
+    result = _min_max([None, 0.0, 100.0])
+    assert result[0] == 0.0, "None should map to 0.0"
+    assert result[1] == 0.0 and result[2] == 1.0, f"unexpected: {result}"
+
+def check_min_max_all_none():
+    result = _min_max([None, None])
+    assert result == [0.0, 0.0]
+
+def check_scorer_worked_example():
+    """Reproduces the worked example from Section 6 of the architecture doc."""
+    kw  = [_kw("A", 1), _kw("B", 2)]
+    w   = [_w("A", 500), _w("B", 100)]
+    s   = [_s("A", 40, 100), _s("B", 10, 100)]
+    items = score_trending(kw, w, s)
+    assert len(items) == 2
+    a = next(it for it in items if it.item_id == "A")
+    b = next(it for it in items if it.item_id == "B")
+    assert a.rank == 1 and b.rank == 2
+    assert abs(a.score - 5.0) < 1e-9, f"A score: {a.score}"
+    assert abs(b.score - 0.0) < 1e-9, f"B score: {b.score}"
+
+def check_scorer_single_candidate():
+    """Single candidate, all equal → norm = 1.0, score = 5.0."""
+    kw = [_kw("X", 1)]
+    w  = [_w("X", 100)]
+    s  = [_s("X", 10, 20)]
+    items = score_trending(kw, w, s)
+    assert len(items) == 1
+    assert items[0].score == 5.0
+
+def check_scorer_missing_keyword_signal():
+    """Candidate with no keyword signal gets norm_keyword=0.0."""
+    w = [_w("A", 100), _w("B", 50)]
+    s = [_s("A", 10, 20), _s("B", 5, 20)]
+    items = score_trending([], w, s)
+    for it in items:
+        assert it.norm_keyword == 0.0, f"expected 0.0, got {it.norm_keyword}"
+        assert it.keyword_rank is None
+
+def check_scorer_noise_gate():
+    """Candidate with watch=0 and sold_rate=0 is excluded."""
+    w = [_w("NOISY", 0), _w("GOOD", 50)]
+    s = [
+        SoldSignal("NOISY", "", 0, 10, 0.0, _NOW, _NOW),
+        SoldSignal("GOOD",  "", 5, 10, 0.5, _NOW, _NOW),
+    ]
+    items = score_trending([], w, s)
+    ids = [it.item_id for it in items]
+    assert "NOISY" not in ids, f"noise candidate leaked: {ids}"
+    assert "GOOD" in ids
+
+def check_scorer_top_n_limit():
+    """More than 10 candidates → only top 10 returned."""
+    w = [_w(str(i), i * 10) for i in range(1, 16)]
+    items = score_trending([], w, [])
+    assert len(items) == 10
+
+def check_scorer_rank_assigned():
+    """rank field counts from 1."""
+    w = [_w("A", 100), _w("B", 50)]
+    items = score_trending([], w, [])
+    ranks = sorted(it.rank for it in items)
+    assert ranks == [1, 2]
+
+def check_scorer_tiebreak_by_watch_count():
+    """Equal scores broken by watch_count descending."""
+    w = [_w("A", 100), _w("B", 200)]
+    items = score_trending([], w, [])
+    assert items[0].item_id == "B", "higher watch count should rank first on tie"
+
+def check_passes_predicate_noise_gate():
+    assert not _passes_predicate(0, 0.0, None, _NOW, _NOW)
+
+def check_passes_predicate_good():
+    assert _passes_predicate(100, 0.5, _NOW, _NOW, _NOW)
+
+def check_passes_predicate_recency_too_old():
+    old = _NOW - timedelta(days=90)
+    assert not _passes_predicate(100, 0.5, old, old, _NOW)
+
+def check_passes_predicate_data_presence():
+    assert not _passes_predicate(None, None, _NOW, _NOW, _NOW)
+
+run_check("_min_max basic normalization [0, 50, 100]", check_min_max_basic)
+run_check("_min_max all-equal values → all 1.0", check_min_max_all_equal)
+run_check("_min_max None values → 0.0", check_min_max_with_none)
+run_check("_min_max all-None → all 0.0", check_min_max_all_none)
+run_check("score_trending worked example from §6 (A=5.0, B=0.0)", check_scorer_worked_example)
+run_check("score_trending single candidate gets score 5.0", check_scorer_single_candidate)
+run_check("score_trending with missing keyword → norm_keyword=0.0", check_scorer_missing_keyword_signal)
+run_check("score_trending noise gate removes watch=0,sold=0 candidate", check_scorer_noise_gate)
+run_check("score_trending returns at most TOP_N (10) items", check_scorer_top_n_limit)
+run_check("score_trending assigns rank 1..N", check_scorer_rank_assigned)
+run_check("score_trending tiebreaks by watch_count descending", check_scorer_tiebreak_by_watch_count)
+run_check("_passes_predicate noise gate (watch=0, sold=0.0)", check_passes_predicate_noise_gate)
+run_check("_passes_predicate passes valid candidate", check_passes_predicate_good)
+run_check("_passes_predicate recency gate drops activity > 60 days ago", check_passes_predicate_recency_too_old)
+run_check("_passes_predicate data-presence gate (no signals at all)", check_passes_predicate_data_presence)
+
+# ── section 14: trending_cache — Redis round-trip with fakeredis ──────────────
+
+print("\n=== Section 14: trending_cache — Redis round-trip (fakeredis, no network) ===")
+
+import fakeredis
+import trending_cache
+from trending_cache import load, save, acquire_lock, release_lock, SCHEMA_VER
+
+def _fake_client() -> fakeredis.FakeRedis:
+    return fakeredis.FakeRedis()
+
+def _sample_items() -> list[TrendingItem]:
+    return [TrendingItem(
+        item_id="1", title="Widget", url="https://ebay.com/1", source="eBay",
+        rank=1, score=4.5, keyword_rank=1, watch_count=100, sold_rate=0.5,
+        norm_keyword=1.0, norm_watch=1.0, norm_sold=1.0,
+    )]
+
+def _sample_signals():
+    kw    = [KeywordSignal("1", "widget", 1, _NOW)]
+    watch = [WatchSignal("1", "Widget", 100, _NOW)]
+    sold  = [SoldSignal("1", "Widget", 50, 100, 0.5, _NOW, _NOW)]
+    return kw, watch, sold
+
+def check_cache_save_and_load():
+    r = _fake_client()
+    items = _sample_items()
+    kw, watch, sold = _sample_signals()
+    save(r, items, kw, watch, sold)
+    loaded, ttl = load(r)
+    assert loaded is not None, "load returned None after save"
+    assert len(loaded) == 1
+    assert loaded[0].item_id == "1"
+    assert ttl > 0
+
+def check_cache_miss_returns_none():
+    r = _fake_client()
+    items, ttl = load(r)
+    assert items is None
+    assert ttl == -2
+
+def check_cache_round_trip_fields():
+    r = _fake_client()
+    original = _sample_items()[0]
+    kw, watch, sold = _sample_signals()
+    save(r, [original], kw, watch, sold)
+    loaded, _ = load(r)
+    it = loaded[0]
+    assert it.title == original.title
+    assert it.score == original.score
+    assert it.norm_keyword == original.norm_keyword
+
+def check_cache_lock_single_flight():
+    r = _fake_client()
+    first  = acquire_lock(r)
+    second = acquire_lock(r)
+    assert first is True,  "first acquire should win the lock"
+    assert second is False, "second acquire should fail while lock is held"
+
+def check_cache_lock_release():
+    r = _fake_client()
+    acquire_lock(r)
+    release_lock(r)
+    again = acquire_lock(r)
+    assert again is True, "should be able to re-acquire after release"
+
+def check_cache_schema_version_in_key():
+    r = _fake_client()
+    kw, watch, sold = _sample_signals()
+    save(r, _sample_items(), kw, watch, sold)
+    keys = [k.decode() for k in r.keys("trending:*")]
+    assert any(SCHEMA_VER in k for k in keys), f"schema version {SCHEMA_VER} not in keys: {keys}"
+
+def check_cache_old_schema_key_not_read():
+    """Saving with v1 then changing SCHEMA_VER to v2 means load() returns None."""
+    r = _fake_client()
+    kw, watch, sold = _sample_signals()
+    save(r, _sample_items(), kw, watch, sold)
+    original_ver = trending_cache.SCHEMA_VER
+    try:
+        trending_cache.SCHEMA_VER = "v999"
+        items, ttl = load(r)
+        assert items is None, "old-schema key should not be read under new SCHEMA_VER"
+    finally:
+        trending_cache.SCHEMA_VER = original_ver
+
+run_check("save() then load() round-trips item list", check_cache_save_and_load)
+run_check("load() on empty Redis returns (None, -2)", check_cache_miss_returns_none)
+run_check("round-trip preserves title, score, norm_keyword", check_cache_round_trip_fields)
+run_check("acquire_lock twice: first True, second False", check_cache_lock_single_flight)
+run_check("acquire_lock after release_lock: can re-acquire", check_cache_lock_release)
+run_check("save() writes versioned key containing SCHEMA_VER", check_cache_schema_version_in_key)
+run_check("bumping SCHEMA_VER means old key is not read", check_cache_old_schema_key_not_read)
+
+# ── section 15: trending_fetcher — offline mock transport ────────────────────
+
+print("\n=== Section 15: trending_fetcher — offline mock transport (no network) ===")
+
+import httpx
+from trending_fetcher import EbayTrendingProvider
+
+_MERCH_FIXTURE = {
+    "getMostWatchedItemsResponse": [{
+        "itemRecommendations": [{
+            "item": [
+                {"itemId": ["100"], "title": ["Vintage Camera"],   "watchCount": ["450"]},
+                {"itemId": ["200"], "title": ["Retro Headphones"], "watchCount": ["200"]},
+            ]
+        }]
+    }]
+}
+
+_FINDING_FIXTURE = {
+    "findCompletedItemsResponse": [{
+        "searchResult": [{
+            "@count": "2",
+            "item": [
+                {"sellingStatus": [{"sellingState": ["EndedWithSales"]}],
+                 "listingInfo": [{"endTime": ["2026-01-01T00:00:00.000Z"]}]},
+                {"sellingStatus": [{"sellingState": ["EndedWithSales"]}],
+                 "listingInfo": [{"endTime": ["2026-01-15T00:00:00.000Z"]}]},
+            ]
+        }]
+    }]
+}
+
+def _mock_transport(merch_resp=None, finding_resp=None):
+    merch   = merch_resp   or _MERCH_FIXTURE
+    finding = finding_resp or _FINDING_FIXTURE
+    def handler(request):
+        if "MerchandisingService" in str(request.url):
+            return httpx.Response(200, json=merch)
+        return httpx.Response(200, json=finding)
+    return httpx.MockTransport(handler)
+
+def check_fetcher_validate_key_empty():
+    p = EbayTrendingProvider(app_id="")
+    try:
+        p._validate_key()
+        raise AssertionError("expected EnvironmentError, got none")
+    except EnvironmentError:
+        pass
+
+def check_fetcher_validate_key_present():
+    EbayTrendingProvider(app_id="dummy")._validate_key()  # should not raise
+
+def check_fetcher_keyword_signals_offline():
+    client = httpx.Client(transport=_mock_transport())
+    p = EbayTrendingProvider(app_id="dummy", client=client)
+    signals = p.fetch_keyword_signals(60)
+    assert len(signals) == 2
+    assert signals[0].item_id == "100"
+    assert signals[0].rank == 1
+    assert signals[1].rank == 2
+
+def check_fetcher_watch_signals_offline():
+    client = httpx.Client(transport=_mock_transport())
+    p = EbayTrendingProvider(app_id="dummy", client=client)
+    signals = p.fetch_watch_signals(["100", "200"], 60)
+    assert len(signals) == 2
+    wc = {s.item_id: s.watch_count for s in signals}
+    assert wc["100"] == 450
+    assert wc["200"] == 200
+
+def check_fetcher_sold_signals_offline():
+    client = httpx.Client(transport=_mock_transport())
+    p = EbayTrendingProvider(app_id="dummy", client=client)
+    signals = p.fetch_sold_signals(["100"], 60)
+    assert len(signals) == 1
+    assert signals[0].sold_count == 2
+    assert signals[0].total_count == 2
+    assert signals[0].sold_rate == 1.0
+
+def check_fetcher_non_200_raises():
+    def handler(request):
+        return httpx.Response(503, text="service unavailable")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    p = EbayTrendingProvider(app_id="dummy", client=client)
+    try:
+        p.fetch_keyword_signals(60)
+        raise AssertionError("expected RuntimeError, got none")
+    except RuntimeError:
+        pass
+
+def check_fetcher_keyword_rank_order():
+    """Earlier items in the list get lower (better) rank numbers."""
+    client = httpx.Client(transport=_mock_transport())
+    p = EbayTrendingProvider(app_id="dummy", client=client)
+    signals = p.fetch_keyword_signals(60)
+    ranks = [s.rank for s in signals]
+    assert ranks == sorted(ranks), f"ranks not ascending: {ranks}"
+
+run_check("_validate_key raises EnvironmentError when app_id is empty", check_fetcher_validate_key_empty)
+run_check("_validate_key does not raise when app_id is set", check_fetcher_validate_key_present)
+run_check("fetch_keyword_signals maps fixture to KeywordSignal list (offline)", check_fetcher_keyword_signals_offline)
+run_check("fetch_watch_signals maps fixture to WatchSignal list (offline)", check_fetcher_watch_signals_offline)
+run_check("fetch_sold_signals maps fixture to SoldSignal list (offline)", check_fetcher_sold_signals_offline)
+run_check("fetch_keyword_signals raises RuntimeError on non-200", check_fetcher_non_200_raises)
+run_check("fetch_keyword_signals returns ranks in ascending order (1, 2, ...)", check_fetcher_keyword_rank_order)
+
+# ── section 16: orchestration — get_trending() end-to-end ────────────────────
+
+print("\n=== Section 16: orchestration — get_trending() end-to-end (fakeredis + stub provider) ===")
+
+from trending_scorer import get_trending
+
+class _StubProvider:
+    """Minimal in-process provider for orchestration tests — no network."""
+    def fetch_keyword_signals(self, lookback_days):
+        return [_kw("A", 1), _kw("B", 2)]
+
+    def fetch_watch_signals(self, item_ids, lookback_days):
+        return [_w("A", 500), _w("B", 100)]
+
+    def fetch_sold_signals(self, item_ids, lookback_days):
+        return [_s("A", 40, 100), _s("B", 10, 100)]
+
+def check_get_trending_returns_items():
+    r = _fake_client()
+    items = get_trending(_StubProvider(), r)
+    assert len(items) > 0
+
+def check_get_trending_top_ranked():
+    r = _fake_client()
+    items = get_trending(_StubProvider(), r)
+    assert items[0].rank == 1
+
+def check_get_trending_cache_hit_skips_provider():
+    """Second call serves from cache — provider calls would be 0 on second call."""
+    call_count = [0]
+    class _CountingProvider(_StubProvider):
+        def fetch_keyword_signals(self, lookback_days):
+            call_count[0] += 1
+            return super().fetch_keyword_signals(lookback_days)
+
+    r = _fake_client()
+    get_trending(_CountingProvider(), r)  # populates cache
+    before = call_count[0]
+    get_trending(_CountingProvider(), r)  # should hit cache
+    assert call_count[0] == before, "cache hit should not call provider again"
+
+def check_get_trending_returns_list_of_trending_items():
+    r = _fake_client()
+    items = get_trending(_StubProvider(), r)
+    for it in items:
+        assert isinstance(it, TrendingItem), f"expected TrendingItem, got {type(it)}"
+
+run_check("get_trending() returns non-empty list", check_get_trending_returns_items)
+run_check("get_trending() first item has rank=1", check_get_trending_top_ranked)
+run_check("get_trending() second call hits cache (provider not called again)", check_get_trending_cache_hit_skips_provider)
+run_check("get_trending() returns list[TrendingItem]", check_get_trending_returns_list_of_trending_items)
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 print(f"\n{'='*40}")

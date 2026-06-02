@@ -44,3 +44,69 @@ class ReverseSearchProvider(Protocol):
     """
 
     def search(self, image: ProcessedImage) -> dict: ...
+
+
+# ── Trending feature signals (one per eBay source) ────────────────────────────
+
+@dataclass
+class KeywordSignal:
+    item_id:    str       # eBay itemId this keyword maps to (or "" for pure-keyword rows)
+    keyword:    str       # the trending search term / category label
+    rank:       int       # 1 = most trending; lower is stronger
+    fetched_at: datetime  # when this signal was pulled (UTC)
+
+
+@dataclass
+class WatchSignal:
+    item_id:     str       # eBay itemId
+    title:       str       # item display title
+    watch_count: int       # raw watch count from getMostWatchedItems
+    fetched_at:  datetime  # UTC
+
+
+@dataclass
+class SoldSignal:
+    item_id:     str            # eBay itemId
+    title:       str            # item display title
+    sold_count:  int            # number of completed-with-sale listings in the window
+    total_count: int            # total completed listings in the window (sold + unsold)
+    sold_rate:   float          # sold_count / total_count, in [0.0, 1.0]; 0.0 if total_count == 0
+    last_sold:   datetime | None  # most recent sale within the window; None if no sales
+    fetched_at:  datetime       # UTC
+
+
+# ── Final ranked output row ───────────────────────────────────────────────────
+
+@dataclass
+class TrendingItem:
+    item_id:       str          # eBay itemId — primary key joining all three signals
+    title:         str          # display title
+    url:           str          # https:// link to the eBay listing
+    source:        str          # marketplace name, e.g. "eBay"
+    rank:          int          # final position in the trending list, 1 (top) – 10
+    score:         float        # final weighted score (un-normalized sum of weighted norms)
+    keyword_rank:  int | None   # None when the keyword signal was missing
+    watch_count:   int | None   # None when the watch signal was missing
+    sold_rate:     float | None # None when the sold signal was missing
+    norm_keyword:  float        # 0.0 when signal missing (graceful degradation)
+    norm_watch:    float
+    norm_sold:     float
+
+
+class TrendingProvider(Protocol):
+    """Contract for any trending-items backend (eBay first, others later).
+
+    Each method fetches one raw signal over a lookback window. The scorer
+    consumes the three signal lists; it never depends on a concrete provider.
+    Mirrors the ReverseSearchProvider pattern.
+    """
+
+    def fetch_keyword_signals(self, lookback_days: int) -> list[KeywordSignal]: ...
+
+    def fetch_watch_signals(
+        self, item_ids: list[str], lookback_days: int
+    ) -> list[WatchSignal]: ...
+
+    def fetch_sold_signals(
+        self, item_ids: list[str], lookback_days: int
+    ) -> list[SoldSignal]: ...

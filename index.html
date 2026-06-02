@@ -443,6 +443,93 @@
       flex-direction: column;
       gap: 2rem;
     }
+
+    .tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2rem;
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      margin-bottom: -1px;
+      padding: 0.6rem 1.2rem;
+      text-transform: uppercase;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+    }
+
+    .tab-btn.active {
+      border-bottom-color: var(--accent);
+      color: var(--text);
+    }
+
+    .tab-panel {
+      display: none;
+      flex-direction: column;
+      gap: 2rem;
+      flex: 1;
+    }
+
+    .tab-panel.active {
+      display: flex;
+    }
+
+    #trendingPanel .section-label {
+      margin-bottom: 0;
+    }
+
+    .trend-rank {
+      color: var(--muted);
+      font-size: 11px;
+      min-width: 24px;
+    }
+
+    .score-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .score-bar-track {
+      width: 50px;
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .score-bar-fill {
+      height: 100%;
+      background: var(--accent2);
+      border-radius: 2px;
+    }
+
+    .score-bar span {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    #trendingStatus {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 11px;
+      color: var(--muted);
+      min-height: 18px;
+    }
   </style>
 </head>
 
@@ -478,31 +565,64 @@
     </aside>
 
     <section class="content">
-      <div class="empty-state" id="emptyState">
-        <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1" viewBox="0 0 24 24"
-          style="color:#333">
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3 21h18M3.75 3h16.5M4.5 3v18M19.5 3v18" />
-        </svg>
-        <p>Upload a product image to find comparable marketplace listings and pricing data.</p>
+      <div class="tabs">
+        <button class="tab-btn active" id="tabMatcher" data-tab="matcherPanel">Matcher</button>
+        <button class="tab-btn" id="tabTrending" data-tab="trendingPanel">Trending</button>
       </div>
 
-      <div id="results">
-        <div class="stats-grid" id="statsGrid"></div>
+      <!-- Matcher tab -->
+      <div class="tab-panel active" id="matcherPanel">
+        <div class="empty-state" id="emptyState">
+          <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1" viewBox="0 0 24 24"
+            style="color:#333">
+            <path stroke-linecap="round" stroke-linejoin="round"
+              d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3 21h18M3.75 3h16.5M4.5 3v18M19.5 3v18" />
+          </svg>
+          <p>Upload a product image to find comparable marketplace listings and pricing data.</p>
+        </div>
 
-        <div>
-          <div class="section-label">Listings — sorted by price</div>
-          <table id="listingsTable">
+        <div id="results">
+          <div class="stats-grid" id="statsGrid"></div>
+
+          <div>
+            <div class="section-label">Listings — sorted by price</div>
+            <table id="listingsTable">
+              <thead>
+                <tr>
+                  <th>Title</th>
+                  <th>Price</th>
+                  <th>Source</th>
+                  <th>Similarity</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="listingsBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Trending tab -->
+      <div class="tab-panel" id="trendingPanel">
+        <div id="trendingStatus">
+          <div class="dot" id="trendingDot"></div>
+          <span id="trendingStatusText">Switch to this tab to load trending items.</span>
+        </div>
+
+        <div id="trendingContent" style="display:none">
+          <div class="section-label" id="trendingLabel">Trending on eBay — top 10</div>
+          <table>
             <thead>
               <tr>
+                <th>#</th>
                 <th>Title</th>
-                <th>Price</th>
                 <th>Source</th>
-                <th>Similarity</th>
-                <th>Status</th>
+                <th>Score</th>
+                <th>Watch</th>
+                <th>Sold rate</th>
               </tr>
             </thead>
-            <tbody id="listingsBody"></tbody>
+            <tbody id="trendingBody"></tbody>
           </table>
         </div>
       </div>
@@ -524,6 +644,70 @@
     const results = document.getElementById('results');
     const statsGrid = document.getElementById('statsGrid');
     const listingsBody = document.getElementById('listingsBody');
+
+    // ── Tab switching ─────────────────────────────────────────────────────────
+    let trendingLoaded = false;
+
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById(btn.dataset.tab).classList.add('active');
+
+        if (btn.dataset.tab === 'trendingPanel' && !trendingLoaded) {
+          loadTrending();
+        }
+      });
+    });
+
+    async function loadTrending() {
+      const dot  = document.getElementById('trendingDot');
+      const txt  = document.getElementById('trendingStatusText');
+      const content = document.getElementById('trendingContent');
+      const body = document.getElementById('trendingBody');
+
+      dot.className = 'dot loading';
+      txt.textContent = 'Fetching trending items from eBay…';
+
+      try {
+        const res  = await fetch('/trending');
+        const data = await res.json();
+
+        if (!res.ok) throw new Error(data.error || 'Server error');
+
+        trendingLoaded = true;
+        dot.className = 'dot success';
+        txt.textContent = `Loaded ${data.items.length} trending items · eBay · 60-day window`;
+
+        body.innerHTML = data.items.map(it => {
+          const scorePct = (it.score / 5) * 100;
+          const soldPct  = it.sold_rate != null ? (it.sold_rate * 100).toFixed(0) + '%' : '—';
+          const titleCell = it.url
+            ? `<a class="listing-link" href="${it.url}" target="_blank" rel="noopener">${it.title}</a>`
+            : it.title;
+          return `
+          <tr>
+            <td class="trend-rank">${it.rank}</td>
+            <td>${titleCell}</td>
+            <td><span class="source-tag">${it.source}</span></td>
+            <td>
+              <div class="score-bar">
+                <div class="score-bar-track"><div class="score-bar-fill" style="width:${scorePct}%"></div></div>
+                <span>${it.score.toFixed(2)}</span>
+              </div>
+            </td>
+            <td>${it.watch_count != null ? it.watch_count.toLocaleString() : '—'}</td>
+            <td>${soldPct}</td>
+          </tr>`;
+        }).join('');
+
+        content.style.display = '';
+      } catch (err) {
+        dot.className = 'dot error';
+        txt.textContent = 'Error: ' + err.message;
+      }
+    }
 
     let selectedFile = null;
 

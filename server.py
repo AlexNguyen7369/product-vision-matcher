@@ -63,5 +63,43 @@ def analyze():
         os.unlink(tmp_path)
 
 
+@app.route("/trending", methods=["GET"])
+def trending():
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(BASE_DIR, "src"))
+
+        import redis, trending_scorer
+        from trending_fetcher import EbayTrendingProvider
+
+        client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+        items = trending_scorer.get_trending(
+            EbayTrendingProvider(), client, lookback_days=60
+        )
+
+        return jsonify({
+            "marketplace":    "eBay",
+            "lookback_days":  60,
+            "items": [
+                {
+                    "rank":         it.rank,
+                    "title":        it.title,
+                    "url":          it.url,
+                    "source":       it.source,
+                    "score":        round(it.score, 3),
+                    "keyword_rank": it.keyword_rank,
+                    "watch_count":  it.watch_count,
+                    "sold_rate":    it.sold_rate,
+                    "norm_keyword": round(it.norm_keyword, 3),
+                    "norm_watch":   round(it.norm_watch, 3),
+                    "norm_sold":    round(it.norm_sold, 3),
+                }
+                for it in items
+            ],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
