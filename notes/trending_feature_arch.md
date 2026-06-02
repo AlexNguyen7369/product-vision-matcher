@@ -28,11 +28,11 @@ Each signal is **min-max normalized independently** to `[0, 1]`, then combined:
 score = (2 × norm_keyword) + (2 × norm_watch) + (1 × norm_sold)
 ```
 
-Results are **cached to disk as JSON** with a **3-hour TTL** so the UI does not
-hammer the eBay API on every page load. The whole fetch/score path sits behind a
-`TrendingProvider` protocol (mirroring the existing `ReverseSearchProvider`
-pattern), so Amazon and other marketplaces can be added later without touching
-the scorer, cache, or Flask layers.
+Results are **cached in Redis** with a **3-hour key TTL** (plus a warm-refresh
+buffer, see §7) so the UI does not hammer the eBay API on every page load. The
+whole fetch/score path sits behind a `TrendingProvider` protocol (mirroring the
+existing `ReverseSearchProvider` pattern), so Amazon and other marketplaces can
+be added later without touching the scorer, cache, or Flask layers.
 
 **Design principles inherited from the existing codebase:**
 
@@ -55,9 +55,10 @@ the scorer, cache, or Flask layers.
                                                 ▼
                               ┌───────────────────────────────────┐
                               │      trending_cache.py            │
-                              │  load() — is cache < 3h old?      │
+                              │  load() — GET redis key (TTL>0?)  │
+                              │  + warm-refresh if TTL < 15 min   │
                               └───────────┬───────────────┬───────┘
-                                  cache HIT │               │ cache MISS / STALE
+                                  cache HIT │               │ cache MISS / EXPIRED
                                           │               │
                   ┌───────────────────────┘               ▼
                   │                         ┌──────────────────────────────────┐
@@ -82,8 +83,10 @@ the scorer, cache, or Flask layers.
                   │                                        ▼
                   │                         ┌──────────────────────────────────┐
                   │                         │  trending_cache.save(...)        │
-                  │                         │  writes data/cache/              │
-                  │                         │       trending_cache.json        │
+                  │                         │  SET trending:ebay:v1:ranked     │
+                  │                         │   value=JSON  EX=10800 (3h TTL)  │
+                  │                         │  (fetch guarded by a SET NX lock │
+                  │                         │   with its own TTL — see §7)     │
                   │                         └──────────────┬───────────────────┘
                   │                                        │
                   └────────────────┬───────────────────────┘
@@ -101,7 +104,8 @@ the scorer, cache, or Flask layers.
 Note the symmetry with the existing image pipeline: `trending_fetcher` is the
 network boundary (like `reverse_search`), `trending_scorer` is the
 filter+rank stage (like `marketplace_parser` + `price_aggregator`), and
-`trending_cache` is the new persistence concern unique to this feature.
+`trending_cache` is the new persistence concern unique to this feature — now
+backed by **Redis** (keyed, TTL'd values) rather than a flat JSON file on disk.
 
 ---
 
@@ -113,7 +117,15 @@ All three signals are sourced from eBay developer APIs. Auth uses an eBay App ID
 ```
 # add to .env
 EBAY_APP_ID=<your_ebay_app_id>
+REDIS_URL=redis://localhost:6379/0     # in-container (compose): redis://redis:6379/0
 ```
+
+> **`REDIS_URL` is a secret/config value and lives in `.env`**, which is already
+> gitignored (`.gitignore` lists `.env`) and `.dockerignore`d (see
+> `dockerfile_plan.md` §2) — it is never committed and never baked into an image
+> layer. It is read at runtime exactly like `SERPAPI_KEY`/`EBAY_APP_ID`, injected
+> via `env_file` under compose. The cache layer reads it through
+> `os.environ["REDIS_URL"]` with a `localhost` fallback for bare local dev.
 
 > The `lookback_days` parameter is **60** for every call. eBay's Merchandising
 > endpoints do not accept an explicit date window, so the 60-day window is
@@ -313,34 +325,83 @@ def _min_max(values: list[float]) -> dict[key, float]: ...   # per-signal normal
 def _passes_predicate(item_id, watch_count, sold_rate, last_active) -> bool: ...
 ```
 
-### 5.3 `src/trending_cache.py` — file-based cache read/write
+### 5.3 `src/trending_cache.py` — Redis-backed cache read/write
 
-**Responsibility:** Persist and retrieve the computed trending list with a 3-hour
-TTL. Owns the only knowledge of the on-disk JSON layout. No eBay or scoring logic
-lives here.
+**Responsibility:** Persist and retrieve the computed trending list in **Redis**
+with a 3-hour key TTL. Owns the only knowledge of the Redis key layout, the JSON
+value encoding, the warm-refresh buffer, and the concurrency lock. No eBay or
+scoring logic lives here.
+
+**Why Redis instead of a flat JSON file:**
+
+- **Native TTL** — Redis expires keys for us (`SET ... EX 10800`); no
+  timestamp-vs-`now` arithmetic, no stale file lingering on disk.
+- **Shared across workers** — under gunicorn (`-w 4`, see `dockerfile_plan.md`
+  §3) all worker processes hit one Redis, so the cache is computed once and
+  shared, instead of each worker keeping its own on-disk/in-process copy.
+- **Atomic primitives** — `SET NX EX` gives us the single-flight lock (below)
+  for free; no temp-file/`os.replace` dance.
+
+**Key naming (versioned):**
+
+```
+trending:<marketplace>:<schema_version>:<part>
+
+trending:ebay:v1:ranked       # the JSON-encoded list[TrendingItem] served to the UI
+trending:ebay:v1:raw          # the raw signal snapshot (for offline re-scoring)
+trending:ebay:v1:lock         # single-flight fetch lock (see §7)
+```
+
+The embedded **`v1`** is a **schema version baked into the key**. If the
+dataclass model changes (a field added/removed/renamed in `TrendingItem` or any
+signal), bump it to `v2` — old `v1` keys are simply never read again and expire
+on their own. No migration, no "corrupt cache" branch: a model change is a key
+rename. (This replaces the old JSON `"version": 1` field.)
 
 **Public interface:**
 
 ```python
-CACHE_PATH = "data/cache/trending_cache.json"   # relative to project root
-TTL_SECONDS = 3 * 60 * 60                        # 3 hours
+import os, redis
 
-def load(path: str = CACHE_PATH, ttl_seconds: int = TTL_SECONDS) -> list[TrendingItem] | None:
-    """Return the cached top-N list if the file exists and is younger than TTL;
-    otherwise None (caller must re-fetch). Returns None on missing/corrupt file."""
+REDIS_URL    = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+SCHEMA_VER   = "v1"                              # bump on dataclass changes
+TTL_SECONDS  = 3 * 60 * 60                       # 3 hours
+REFRESH_FLOOR_SECONDS = 15 * 60                  # warm-refresh when remaining TTL < 15 min
+LOCK_TTL_SECONDS = 60                            # lock self-expires so a crash can't wedge it
+
+def _key(part: str, marketplace: str = "ebay") -> str:
+    return f"trending:{marketplace}:{SCHEMA_VER}:{part}"
+
+def load(client: redis.Redis) -> tuple[list[TrendingItem] | None, int]:
+    """GET trending:ebay:v1:ranked. Returns (items, remaining_ttl_seconds).
+    - (items, ttl)  on hit, where ttl = client.ttl(key) so the caller can decide
+                    whether to trigger a warm refresh (ttl < REFRESH_FLOOR_SECONDS).
+    - (None, -2)    on miss/expired (Redis TTL of -2 == key does not exist).
+    Returns (None, -2) and logs if Redis is unreachable (caller falls through to
+    a live fetch — there is no on-disk fallback, see §7 on in-memory fallback)."""
 
 def save(
+    client: redis.Redis,
     items: list[TrendingItem],
     keyword_signals: list[KeywordSignal],
     watch_signals:   list[WatchSignal],
     sold_signals:    list[SoldSignal],
-    path: str = CACHE_PATH,
+    marketplace: str = "ebay",
 ) -> None:
-    """Serialize raw signals + final ranked list + timestamp to JSON atomically
-    (write temp file, then os.replace) so a crash mid-write can't corrupt cache."""
+    """SET trending:ebay:v1:ranked = json(items)  EX=TTL_SECONDS, and likewise
+    trending:ebay:v1:raw = json(raw signals). Single round-trip per key; Redis
+    applies the TTL atomically, so there is no partially-written/corrupt state."""
 
-def is_fresh(path: str = CACHE_PATH, ttl_seconds: int = TTL_SECONDS) -> bool:
-    """True if the cache file exists and its stored timestamp is within TTL."""
+def acquire_lock(client: redis.Redis, marketplace: str = "ebay") -> bool:
+    """SET trending:ebay:v1:lock = <token>  NX EX=LOCK_TTL_SECONDS.
+    Returns True if this worker won the right to fetch from eBay, False if another
+    worker already holds it. The EX makes the lock self-healing: if the holder
+    crashes before releasing, the lock expires after LOCK_TTL_SECONDS instead of
+    blocking all future fetches forever (see §7)."""
+
+def release_lock(client: redis.Redis, marketplace: str = "ebay") -> None:
+    """DEL the lock key once the fetch+save completes (best-effort; the LOCK_TTL
+    is the backstop if this DEL is missed)."""
 ```
 
 ### 5.4 Orchestration helper
@@ -351,17 +412,45 @@ it. It depends on the **`TrendingProvider` protocol**, not on
 `EbayTrendingProvider`:
 
 ```python
-def get_trending(provider: TrendingProvider, lookback_days: int = 60) -> list[TrendingItem]:
-    cached = trending_cache.load()
-    if cached is not None:
-        return cached
-    kw  = provider.fetch_keyword_signals(lookback_days)
-    ids = [k.item_id for k in kw if k.item_id]
-    w   = provider.fetch_watch_signals(ids, lookback_days)
-    s   = provider.fetch_sold_signals(ids, lookback_days)
-    items = trending_scorer.score_trending(kw, w, s)
-    trending_cache.save(items, kw, w, s)
-    return items
+def get_trending(
+    provider: TrendingProvider,
+    client: redis.Redis,
+    lookback_days: int = 60,
+) -> list[TrendingItem]:
+    items, ttl = trending_cache.load(client)
+
+    if items is not None:
+        # Cache HIT. If the key is close to expiry, kick a warm refresh so the
+        # next user never waits on a cold eBay round-trip (see §7). The refresh
+        # is single-flighted by the lock, and we still serve the current (warm)
+        # data immediately — refresh does not block this request.
+        if ttl < trending_cache.REFRESH_FLOOR_SECONDS:
+            _maybe_refresh(provider, client, lookback_days)  # best-effort, async/inline
+        return items
+
+    # Cache MISS / EXPIRED → fetch, but guard with a single-flight lock so a
+    # thundering herd of requests doesn't fire N concurrent eBay fetches.
+    return _fetch_and_cache(provider, client, lookback_days)
+
+
+def _fetch_and_cache(provider, client, lookback_days) -> list[TrendingItem]:
+    if not trending_cache.acquire_lock(client):
+        # Another worker is already fetching. Briefly re-check the cache; if it's
+        # populated by the time we look, serve that. Otherwise compute locally
+        # this once (no stale fallback exists — see §7).
+        items, _ = trending_cache.load(client)
+        if items is not None:
+            return items
+    try:
+        kw  = provider.fetch_keyword_signals(lookback_days)
+        ids = [k.item_id for k in kw if k.item_id]
+        w   = provider.fetch_watch_signals(ids, lookback_days)
+        s   = provider.fetch_sold_signals(ids, lookback_days)
+        items = trending_scorer.score_trending(kw, w, s)
+        trending_cache.save(client, items, kw, w, s)
+        return items
+    finally:
+        trending_cache.release_lock(client)   # LOCK_TTL is the backstop if this is missed
 ```
 
 ---
@@ -441,91 +530,126 @@ score(B) = 2*0.0 + 2*0.0 + 1*0.0 = 0.0   → rank 2
 
 ---
 
-## 7. Caching Strategy
+## 7. Caching Strategy (Redis)
 
 **Why:** eBay APIs are rate-limited and slow; trending data changes slowly. A
-3-hour cache keeps the UI snappy and well within rate limits.
+3-hour cache keeps the UI snappy and well within rate limits. Redis (rather than
+a flat JSON file) gives us native key expiry, a cache shared across all gunicorn
+workers, and atomic primitives for single-flight fetching.
 
-**Location:** `data/cache/trending_cache.json` (relative to project root). The
-`data/cache/` directory must be created (it does not exist yet).
+**Backing store:** Redis, reached via `REDIS_URL` from `.env` (§3). Persistence
+(RDB/AOF snapshots) is configured on the Redis container so the cache is **read
+back warm on startup** rather than cold — see `dockerfile_plan.md` §4.2.
 
-**TTL logic:**
+### 7.1 Keys, values, and the 3-hour TTL
 
-- On each `GET /trending`, `trending_cache.load()` checks the stored
-  `generated_at` timestamp.
-- If `now - generated_at < 3 hours` → **cache hit**, return the stored ranked
-  list, no eBay calls.
-- Otherwise (file missing, corrupt, or older than 3 hours) → **cache miss**,
-  re-fetch from eBay, re-score, overwrite the cache file, return fresh results.
-- TTL is checked against the **timestamp stored inside the JSON**, not the file's
-  mtime, so the cache is robust to copies/syncs that change mtime.
+- **Ranked list:** `trending:ebay:v1:ranked` → JSON-encoded `list[TrendingItem]`.
+- **Raw snapshot:** `trending:ebay:v1:raw` → JSON of the three raw signal lists,
+  so the scorer can be re-run/re-tuned offline and so `test_setup.py` has
+  realistic fixtures (same rationale as the old `raw_signals` block).
+- Both are written with **`SET ... EX 10800`** (3 hours). Redis evicts them
+  automatically when the TTL hits zero — **expiry within a 3-hour window is the
+  store's job**, not application timestamp math. On `GET /trending`:
+  - key present (TTL > 0) → **cache hit**, return it, no eBay calls;
+  - key absent (TTL == -2, expired/evicted) → **cache miss**, fetch + score +
+    `SET EX` + return.
 
-**File structure:**
+### 7.2 Warm-refresh buffer (refresh before expiry, when TTL < 15 min)
 
-```json
-{
-  "version": 1,
-  "marketplace": "ebay",
-  "generated_at": "2026-05-27T14:03:22Z",
-  "lookback_days": 60,
-  "raw_signals": {
-    "keyword": [
-      { "item_id": "...", "keyword": "...", "rank": 1, "fetched_at": "..." }
-    ],
-    "watch": [
-      {
-        "item_id": "...",
-        "title": "...",
-        "watch_count": 512,
-        "fetched_at": "..."
-      }
-    ],
-    "sold": [
-      {
-        "item_id": "...",
-        "title": "...",
-        "sold_count": 8,
-        "total_count": 20,
-        "sold_rate": 0.4,
-        "last_sold": "...",
-        "fetched_at": "..."
-      }
-    ]
-  },
-  "ranked": [
-    {
-      "item_id": "...",
-      "title": "...",
-      "url": "https://www.ebay.com/itm/...",
-      "source": "eBay",
-      "rank": 1,
-      "score": 4.62,
-      "keyword_rank": 1,
-      "watch_count": 512,
-      "sold_rate": 0.4,
-      "norm_keyword": 1.0,
-      "norm_watch": 0.93,
-      "norm_sold": 0.88
-    }
-  ]
-}
+A plain TTL means the *one* unlucky request that arrives the moment the key
+expires eats the full cold eBay round-trip. To keep data **warm**, `load()`
+returns the key's **remaining TTL** alongside the value, and the orchestrator
+proactively refreshes *before* expiry:
+
+```
+on cache HIT:
+    if remaining_ttl < REFRESH_FLOOR_SECONDS (15 min):
+        single-flight a background refresh   # re-fetch, re-score, SET EX 10800
+    return the currently-cached (still-warm) data immediately   # never blocks
 ```
 
-Storing `raw_signals` as well as `ranked` means the scorer can be re-run /
-re-tuned offline against a captured snapshot without another eBay round-trip — and
-gives `test_setup.py` realistic fixture data.
+So during the last 15 minutes of a key's life, the first request to notice
+triggers a refresh that resets the TTL back to 3 hours, while still serving the
+existing data with zero added latency. Users effectively never hit a cold cache
+under steady traffic. The refresh is guarded by the same lock (§7.4) so only one
+worker actually re-fetches.
 
-**Cache invalidation:**
+### 7.3 Schema versioning via the key (the `v1` segment)
 
-- **Time-based** (primary): the 3-hour TTL above.
-- **Manual:** delete `data/cache/trending_cache.json` to force a refetch on the
-  next request.
-- **Schema bump:** the `version` field lets `load()` reject incompatible old
-  caches (return `None`) after the data model changes.
+The schema version is **embedded in the key name** (`trending:ebay:**v1**:...`)
+rather than stored as a `"version"` field inside the value. If the dataclass
+model changes — a field added to or removed from `TrendingItem` or any signal —
+**bump the segment to `v2`** in `trending_cache.SCHEMA_VER`. Effect:
 
-**Atomicity:** `save()` writes to a temp file in the same directory then
-`os.replace()`s it over the target, so a crash mid-write never leaves a corrupt
-JSON file that `load()` would choke on.
+- new writes go to `trending:ebay:v2:*`;
+- old `v1:*` keys are never read again and **expire on their own** within 3 hours;
+- no migration code, no "is this old shape compatible?" branch, no corrupt-cache
+  handling. A model change is a one-line key rename.
+
+This replaces the old JSON `"version": 1` field and its `load()`-rejects-old-shape
+logic.
+
+### 7.4 Single-flight lock (with its own TTL)
+
+On a cache miss (or a warm refresh), many concurrent requests could otherwise
+each fire a full three-call eBay fetch — a thundering herd. A Redis lock
+single-flights it:
+
+```
+acquire:  SET trending:ebay:v1:lock <token> NX EX 60
+          → NX: only the first caller sets it (wins the fetch)
+          → EX 60: the lock SELF-EXPIRES after LOCK_TTL_SECONDS
+release:  DEL trending:ebay:v1:lock   (best-effort, in a finally:)
+```
+
+The **lock has its own TTL** precisely so a missed unlock can't wedge the
+feature: if the worker holding the lock **crashes, is killed, or times out before
+the `DEL`**, the lock would otherwise stay set forever and *no* worker could ever
+refresh the cache again. The `EX 60` guarantees the lock evaporates after at most
+60 seconds, after which a future request can re-acquire and fetch. The explicit
+`DEL` in the `finally:` is the fast path; the TTL is the safety backstop.
+
+Losers of the lock briefly re-check the cache (another worker may have just
+populated it) and serve that; only if it's still empty do they compute once
+locally for that request.
+
+### 7.5 In-memory fallback note (multi-worker, Redis-down)
+
+> **Note / known limitation — not a feature, just documented behavior.**
+>
+> Under gunicorn each worker is a separate process with its **own memory**. If a
+> worker keeps a last-known-good copy of the trending list in a process-local
+> variable as a fallback for when Redis is unreachable, that fallback is **per
+> worker and not shared**: worker A may have a warm in-memory copy while worker B,
+> **freshly started (or restarted) while Redis is down, has no in-memory data at
+> all** — it never populated its local copy, so it has nothing stale to serve and
+> must either do a live eBay fetch or surface an error.
+>
+> Consequences to keep in mind:
+> - Responses can be **inconsistent across workers** during a Redis outage (one
+>   worker serves cached data, another serves freshly-fetched or empty).
+> - A just-started worker has **no warm state** — the in-memory fallback only
+>   helps workers that were alive long enough to have cached a copy before Redis
+>   went down.
+>
+> This is acceptable for the dev/single-host scope (Redis is the source of truth
+> and is normally up; its RDB/AOF snapshot survives restarts). It's noted here so
+> the behavior isn't mistaken for a bug, and so a future "shared warm fallback"
+> (e.g. a secondary store, or pinning workers) is a conscious decision rather than
+> a surprise.
+
+### 7.6 Cache invalidation
+
+- **Time-based** (primary): the 3-hour key TTL (§7.1), refreshed early by the
+  warm buffer (§7.2).
+- **Manual:** `DEL trending:ebay:v1:ranked trending:ebay:v1:raw` (or `FLUSHDB` in
+  dev) forces a refetch on the next request.
+- **Schema bump:** change `SCHEMA_VER` to `v2` (§7.3) — old keys age out on their
+  own.
+
+**Atomicity:** each `SET ... EX` is a single atomic Redis operation — value and
+TTL land together — so there is no partially-written/corrupt state for `load()`
+to choke on (this replaces the old temp-file + `os.replace` dance).
 
 ---
 
@@ -598,10 +722,13 @@ def trending():
         import sys
         sys.path.insert(0, os.path.join(BASE_DIR, "src"))
 
-        import trending_scorer
+        import redis, trending_scorer
         from trending_fetcher import EbayTrendingProvider
 
-        items = trending_scorer.get_trending(EbayTrendingProvider(), lookback_days=60)
+        client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+        items = trending_scorer.get_trending(
+            EbayTrendingProvider(), client, lookback_days=60
+        )
 
         return jsonify({
             "marketplace": "eBay",
@@ -678,11 +805,15 @@ the Git Commit Policy, commit after each green step with a one-sentence message.
    tie-breaking determinism.
    _Commit:_ `add trending scorer with min-max normalization and weighted ranking`
 
-3. **Cache** — `src/trending_cache.py`: `save` / `load` / `is_fresh`, atomic
-   write, TTL + version checks. Create the `data/cache/` directory.
-   _Tests:_ round-trip save→load, stale-file returns `None`, corrupt-file returns
-   `None`, version-mismatch returns `None` — all against a temp path, no network.
-   _Commit:_ `add file-based trending cache with 3-hour ttl`
+3. **Cache** — `src/trending_cache.py`: `load` / `save` / `acquire_lock` /
+   `release_lock` against Redis (`SET ... EX`, versioned keys, lock with its own
+   TTL). Add `redis` to `requirements.txt`. No `data/cache/` directory needed —
+   Redis is the store.
+   _Tests:_ round-trip save→load and TTL/warm-refresh logic against
+   **`fakeredis`** (in-process, no network); lock single-flight (`acquire` twice
+   → second returns `False`); schema-version bump means an old-version key isn't
+   read.
+   _Commit:_ `add redis-backed trending cache with versioned keys, 3h ttl, and single-flight lock`
 
 4. **Fetcher** — `src/trending_fetcher.py`: `EbayTrendingProvider` against the
    three eBay endpoints, app-id injection, error handling.
@@ -690,10 +821,12 @@ the Git Commit Policy, commit after each green step with a one-sentence message.
    `httpx.MockTransport`; `_validate_key()` guard with `app_id=""`. No real network.
    _Commit:_ `add ebay trending provider implementing TrendingProvider protocol`
 
-5. **Orchestration + Flask route** — wire `get_trending()` and add `GET /trending`
-   to `server.py`.
-   _Tests:_ `get_trending()` with a fake provider (in-process stub implementing the
-   protocol) end-to-end through scorer + cache, asserting top-10 order.
+5. **Orchestration + Flask route** — wire `get_trending(provider, client, ...)`
+   (cache lookup → warm-refresh check → single-flight fetch) and add
+   `GET /trending` to `server.py`.
+   _Tests:_ `get_trending()` with a fake provider (in-process stub) + `fakeredis`
+   end-to-end through scorer + cache, asserting top-10 order, a cache hit skips
+   the provider, and TTL < 15 min triggers a refresh.
    _Commit:_ `add /trending flask route backed by ebay trending provider`
 
 6. **UI tab** — add the Trending tab + panel + fetch logic to `index.html`.
