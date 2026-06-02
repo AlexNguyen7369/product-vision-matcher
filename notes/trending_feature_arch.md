@@ -1,8 +1,37 @@
 # Trending Items — Feature Architecture
 
-> **Status:** Design complete, not yet implemented.
+> **Status:** Implemented. Offline unit tests pass (107 passed, 12 pre-existing failures unrelated to this feature). Online integration testing with a real `EBAY_APP_ID` and live Redis not yet done.
 > **Scope:** Development feature. eBay only for the first cut; built behind a
 > provider protocol so other marketplaces drop in later.
+
+## Prerequisites
+
+### Environment variables (add to `.env`)
+
+```
+EBAY_APP_ID=<your_ebay_app_id>
+REDIS_URL=redis://localhost:6379/0     # local dev; use redis://redis:6379/0 inside Docker Compose
+```
+
+**EBAY_APP_ID** — get from [developer.ebay.com](https://developer.ebay.com/):
+- Register/login and create an app to obtain a **Client ID** (that is the App ID).
+- Requires access to two APIs: **Merchandising API** (`getMostWatchedItems`) and **Finding API** (`findCompletedItems`). Both are available on a free developer account.
+
+**REDIS_URL** — requires a running Redis instance:
+- Local dev (Mac): `brew install redis && brew services start redis`
+- Docker Compose: the compose file handles it; set `REDIS_URL=redis://redis:6379/0`
+
+### Python dependencies (add to `requirements.txt`)
+
+| Package | Purpose |
+| ------- | ------- |
+| `redis` | Python client used by `trending_cache.py` |
+| `fakeredis` | In-process Redis for offline tests in `test_setup.py` |
+| `httpx` | HTTP client for `trending_fetcher.py` (likely already present) |
+
+Your existing `SERPAPI_KEY` is unaffected — the Trending feature is independent of it.
+
+---
 
 This document is the implementation spec for the **Trending Items** feature: a
 new tab in the existing Flask UI that surfaces the top 10 trending items from
