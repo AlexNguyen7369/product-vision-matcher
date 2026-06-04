@@ -618,8 +618,8 @@
                 <th>Title</th>
                 <th>Source</th>
                 <th>Score</th>
-                <th>Watch</th>
-                <th>Sold rate</th>
+                <th>Sold</th>
+                <th>Sell-through</th>
               </tr>
             </thead>
             <tbody id="trendingBody"></tbody>
@@ -697,7 +697,7 @@
                 <span>${it.score.toFixed(2)}</span>
               </div>
             </td>
-            <td>${it.watch_count != null ? it.watch_count.toLocaleString() : '—'}</td>
+            <td>${it.sold_quantity != null ? it.sold_quantity.toLocaleString() : '—'}</td>
             <td>${soldPct}</td>
           </tr>`;
         }).join('');

@@ -87,12 +87,12 @@ def trending():
                     "url":          it.url,
                     "source":       it.source,
                     "score":        round(it.score, 3),
-                    "keyword_rank": it.keyword_rank,
-                    "watch_count":  it.watch_count,
-                    "sold_rate":    it.sold_rate,
-                    "norm_keyword": round(it.norm_keyword, 3),
-                    "norm_watch":   round(it.norm_watch, 3),
-                    "norm_sold":    round(it.norm_sold, 3),
+                    "keyword_rank":  it.keyword_rank,
+                    "sold_quantity": it.sold_quantity,
+                    "sold_rate":     it.sold_rate,
+                    "norm_keyword":  round(it.norm_keyword, 3),
+                    "norm_volume":   round(it.norm_volume, 3),
+                    "norm_sold":     round(it.norm_sold, 3),
                 }
                 for it in items
             ],

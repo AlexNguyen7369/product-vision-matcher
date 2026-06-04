@@ -1,6 +1,13 @@
 # Trending Items — Feature Architecture
 
-> **Status:** Implemented. Offline unit tests pass (107 passed, 12 pre-existing failures unrelated to this feature). Online integration testing with a real `EBAY_APP_ID` and live Redis not yet done.
+> **Status:** Implemented on the modern **eBay Browse API** (OAuth client-credentials).
+> Offline unit tests pass (127 passed, 0 failed). Online integration testing with
+> real `EBAY_CLIENT_ID`/`EBAY_CLIENT_SECRET` and live Redis not yet done.
+> **Migration note:** the original design used the now-deprecated Merchandising
+> (`getMostWatchedItems`) and Finding (`findCompletedItems`) APIs. Those were
+> retired by eBay, so the feature was migrated to the Browse API. The watch-count
+> signal has no Browse equivalent and was replaced by **sold volume**
+> (`estimatedSoldQuantity`); see §1/§3.
 > **Scope:** Development feature. eBay only for the first cut; built behind a
 > provider protocol so other marketplaces drop in later.
 
@@ -9,13 +16,17 @@
 ### Environment variables (add to `.env`)
 
 ```
-EBAY_APP_ID=<your_ebay_app_id>
+EBAY_CLIENT_ID=<your_ebay_client_id>
+EBAY_CLIENT_SECRET=<your_ebay_client_secret>
 REDIS_URL=redis://localhost:6379/0     # local dev; use redis://redis:6379/0 inside Docker Compose
 ```
 
-**EBAY_APP_ID** — get from [developer.ebay.com](https://developer.ebay.com/):
-- Register/login and create an app to obtain a **Client ID** (that is the App ID).
-- Requires access to two APIs: **Merchandising API** (`getMostWatchedItems`) and **Finding API** (`findCompletedItems`). Both are available on a free developer account.
+**EBAY_CLIENT_ID / EBAY_CLIENT_SECRET** — get from [developer.ebay.com](https://developer.ebay.com/):
+- Register/login and create an app keyset to obtain a **Client ID** and **Client Secret** (production keyset).
+- These two are exchanged for an **application access token** via the OAuth 2.0
+  *client-credentials* grant (scope `https://api.ebay.com/oauth/api_scope`). No
+  `EBAY_RUNAME` / user-consent flow is needed for public Browse search.
+- The **Browse API** is available on a standard developer account (default 5,000 calls/day).
 
 **REDIS_URL** — requires a running Redis instance:
 - Local dev (Mac): `brew install redis && brew services start redis`
@@ -45,16 +56,16 @@ Add a **Trending** tab to the existing Product Vision Matcher UI. The tab shows
 the **top 10 trending eBay items** over a rolling **60-day window**, ranked by a
 weighted score built from three independent signals:
 
-| Signal              | Source (eBay)                             | Weight |
-| ------------------- | ----------------------------------------- | ------ |
-| Keyword search rank | Merchandising API — trending keywords     | **2×** |
-| Watch count         | Merchandising API — `getMostWatchedItems` | **2×** |
-| Sold rate           | Finding API — `findCompletedItems`        | **1×** |
+| Signal              | Source (eBay Browse API)                                   | Weight |
+| ------------------- | ---------------------------------------------------------- | ------ |
+| Keyword search rank | `item_summary/search` — Best Match position per seed query | **2×** |
+| Sold volume         | `getItem` — `estimatedSoldQuantity` (units sold)           | **2×** |
+| Sell-through rate   | `getItem` — sold / (sold + `estimatedAvailableQuantity`)   | **1×** |
 
 Each signal is **min-max normalized independently** to `[0, 1]`, then combined:
 
 ```
-score = (2 × norm_keyword) + (2 × norm_watch) + (1 × norm_sold)
+score = (2 × norm_keyword) + (2 × norm_volume) + (1 × norm_sold)
 ```
 
 Results are **cached in Redis** with a **3-hour key TTL** (plus a warm-refresh
@@ -140,64 +151,70 @@ backed by **Redis** (keyed, TTL'd values) rather than a flat JSON file on disk.
 
 ## 3. eBay API Endpoints
 
-All three signals are sourced from eBay developer APIs. Auth uses an eBay App ID
-(a.k.a. Client ID), read from the environment exactly like `SERPAPI_KEY`:
+All three signals come from the modern **Browse API** (`buy/browse/v1`). Auth is an
+OAuth 2.0 **application access token** minted from `EBAY_CLIENT_ID` +
+`EBAY_CLIENT_SECRET` via the client-credentials grant; the token is cached on the
+provider instance and sent as `Authorization: Bearer <token>` with
+`X-EBAY-C-MARKETPLACE-ID: EBAY_US`.
 
 ```
 # add to .env
-EBAY_APP_ID=<your_ebay_app_id>
+EBAY_CLIENT_ID=<your_ebay_client_id>
+EBAY_CLIENT_SECRET=<your_ebay_client_secret>
 REDIS_URL=redis://localhost:6379/0     # in-container (compose): redis://redis:6379/0
 ```
 
-> **`REDIS_URL` is a secret/config value and lives in `.env`**, which is already
+> **All three are secret/config values and live in `.env`**, which is already
 > gitignored (`.gitignore` lists `.env`) and `.dockerignore`d (see
-> `dockerfile_plan.md` §2) — it is never committed and never baked into an image
-> layer. It is read at runtime exactly like `SERPAPI_KEY`/`EBAY_APP_ID`, injected
-> via `env_file` under compose. The cache layer reads it through
-> `os.environ["REDIS_URL"]` with a `localhost` fallback for bare local dev.
+> `dockerfile_plan.md` §2) — never committed, never baked into an image layer.
+> They are read at runtime exactly like `SERPAPI_KEY`, injected via `env_file`
+> under compose. `EBAY_RUNAME` is **not** used (no user-consent flow).
 
-> The `lookback_days` parameter is **60** for every call. eBay's Merchandising
-> endpoints do not accept an explicit date window, so the 60-day window is
-> enforced client-side via the predicate filter (Section 8) on each item's
-> last-activity / sold date. The Finding API `findCompletedItems` **does**
-> support an item-filter date range, applied below.
+> The `lookback_days` parameter is **60**. The Browse API returns active listings
+> and a point-in-time `estimatedSoldQuantity`; it exposes no per-sale date window,
+> so the 60-day window is a soft client-side concept only (the recency gate in
+> §8 falls back to `fetched_at`, which is always current for live listings).
 
-### 3.1 Keyword signal — Merchandising API (trending keywords)
+### 3.0 OAuth token — client-credentials grant
 
-|                |                                                                                                                                                                                            |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Endpoint**   | `https://svcs.ebay.com/MerchandisingService`                                                                                                                                               |
-| **Operation**  | `getMostWatchedItems` used as the keyword/category seed, OR the eBay "trending searches" feed if available to the account                                                                  |
-| **Key params** | `OPERATION-NAME`, `SERVICE-VERSION=1.1.0`, `CONSUMER-ID=<EBAY_APP_ID>`, `RESPONSE-DATA-FORMAT=JSON`, `maxResults` (request ≥ enough to cover top 10 after filtering, e.g. 50)              |
-| **Returns**    | Ranked list of trending keywords/categories. The **rank position** (1 = most trending) is the raw keyword signal. Lower position = stronger signal; the scorer inverts it (see Section 6). |
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Endpoint**   | `POST https://api.ebay.com/identity/v1/oauth2/token`                                                         |
+| **Headers**    | `Content-Type: application/x-www-form-urlencoded`, `Authorization: Basic base64(CLIENT_ID:CLIENT_SECRET)`    |
+| **Body**       | `grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope`                                   |
+| **Returns**    | `{ "access_token": "...", "expires_in": 7200 }` — an application token valid 2h. Cached per provider instance. |
 
-> If the account does not have access to a dedicated trending-keywords feed, the
-> implementation derives a keyword rank from the ordering of the most-watched /
-> most-popular items returned, treating list position as the rank. The
-> `KeywordSignal.rank` field captures this position regardless of source.
+### 3.1 Keyword/rank signal — `item_summary/search` (Best Match)
 
-### 3.2 Watch signal — Merchandising API `getMostWatchedItems`
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Endpoint**   | `GET https://api.ebay.com/buy/browse/v1/item_summary/search`                                                 |
+| **Key params** | `q=<seed query>`, `limit=<max_results>` (default Best Match sort — eBay's relevance/popularity ordering)     |
+| **Returns**    | `itemSummaries[]` with `itemId`, `title`, `itemWebUrl`. The item's **position** within each seed query is its rank (1 = top). Items appearing under multiple seeds keep their best (lowest) rank; the scorer inverts rank (see §6). |
 
-|                |                                                                                                                                                                 |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Endpoint**   | `https://svcs.ebay.com/MerchandisingService`                                                                                                                    |
-| **Operation**  | `getMostWatchedItems`                                                                                                                                           |
-| **Key params** | `OPERATION-NAME=getMostWatchedItems`, `SERVICE-VERSION=1.1.0`, `CONSUMER-ID=<EBAY_APP_ID>`, `RESPONSE-DATA-FORMAT=JSON`, `maxResults=20`, optional `categoryId` |
-| **Returns**    | List of items each with `itemId`, `title`, `viewItemURL`, `watchCount`, `categoryId`. `watchCount` is the raw watch signal.                                     |
+> The provider iterates a curated list of seed queries (`DEFAULT_SEED_QUERIES` in
+> `trending_fetcher.py`, e.g. *electronics, sneakers, trading cards, …*), since
+> Browse search requires a query. `KeywordSignal` now also carries `title` and
+> `url` so the ranked output links straight to the live listing.
 
-### 3.3 Sold signal — Finding API `findCompletedItems`
+### 3.2 Sold-volume signal — `getItem` `estimatedSoldQuantity`
 
-|                |                                                                                                                                                                                                                                                                                                                                                    |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Endpoint**   | `https://svcs.ebay.com/services/search/FindingService/v1`                                                                                                                                                                                                                                                                                          |
-| **Operation**  | `findCompletedItems`                                                                                                                                                                                                                                                                                                                               |
-| **Key params** | `OPERATION-NAME=findCompletedItems`, `SERVICE-VERSION=1.13.0`, `SECURITY-APPNAME=<EBAY_APP_ID>`, `RESPONSE-DATA-FORMAT=JSON`, one of `keywords` or `categoryId`, `itemFilter(0).name=EndTimeFrom` + `itemFilter(0).value=<now-60d ISO8601>`, `itemFilter(1).name=SoldItemsOnly` + `itemFilter(1).value=true`, `paginationInput.entriesPerPage=100` |
-| **Returns**    | Completed/sold listings each with `itemId`, `title`, `sellingStatus.sellingState` (`EndedWithSales`), and end time. **Sold rate** is computed client-side as `sold_count / total_completed` per item-or-keyword grouping over the window.                                                                                                          |
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Endpoint**   | `GET https://api.ebay.com/buy/browse/v1/item/{item_id}` (item_id URL-encoded)                                |
+| **Returns**    | `estimatedAvailabilities[0].estimatedSoldQuantity` — units sold for the listing. This is the raw volume signal (replaces the retired watch count). No special access required. |
 
-**Querying order:** `getMostWatchedItems` is called first to obtain the candidate
-`item_ids` (and seed keywords/categories). Those `item_ids` are then passed into
-`fetch_watch_signals` and `fetch_sold_signals` so all three signals are keyed to
-the same candidate set.
+### 3.3 Sell-through signal — `getItem` sold / (sold + available)
+
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Endpoint**   | Same `getItem` call as §3.2 (response is memoized per item so it is fetched once).                           |
+| **Returns**    | `sold_rate = estimatedSoldQuantity / (estimatedSoldQuantity + estimatedAvailableQuantity)`, in `[0,1]`. `SoldSignal.last_sold` is always `None` (Browse exposes no per-sale timestamps). |
+
+**Querying order:** `fetch_keyword_signals` runs the seed searches first to obtain
+the candidate `item_ids` (plus titles/urls). Those `item_ids` are passed into
+`fetch_volume_signals` and `fetch_sold_signals`, which share one memoized
+`getItem` call per id, so all three signals are keyed to the same candidate set.
 
 ---
 

@@ -3,20 +3,20 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from models import KeywordSignal, SoldSignal, TrendingItem, WatchSignal
+from models import KeywordSignal, SoldSignal, TrendingItem, VolumeSignal
 
 if TYPE_CHECKING:
     from models import TrendingProvider
 
 KEYWORD_WEIGHT = 2.0
-WATCH_WEIGHT   = 2.0
+VOLUME_WEIGHT  = 2.0
 SOLD_WEIGHT    = 1.0
 TOP_N          = 10
 
 
 def score_trending(
     keyword_signals: list[KeywordSignal],
-    watch_signals:   list[WatchSignal],
+    volume_signals:  list[VolumeSignal],
     sold_signals:    list[SoldSignal],
     top_n: int = TOP_N,
 ) -> list[TrendingItem]:
@@ -28,13 +28,18 @@ def score_trending(
         if kw.item_id:
             c = candidates.setdefault(kw.item_id, {"item_id": kw.item_id, "title": "", "url": ""})
             c["keyword_rank"] = kw.rank
+            if kw.title:
+                c["title"] = kw.title
+            if kw.url:
+                c["url"] = kw.url
             c.setdefault("fetched_at", kw.fetched_at)
 
-    for w in watch_signals:
-        c = candidates.setdefault(w.item_id, {"item_id": w.item_id, "title": w.title, "url": ""})
-        c["watch_count"] = w.watch_count
-        c["title"] = w.title
-        c.setdefault("fetched_at", w.fetched_at)
+    for v in volume_signals:
+        c = candidates.setdefault(v.item_id, {"item_id": v.item_id, "title": v.title, "url": ""})
+        c["sold_quantity"] = v.sold_quantity
+        if v.title:
+            c["title"] = v.title
+        c.setdefault("fetched_at", v.fetched_at)
 
     for s in sold_signals:
         c = candidates.setdefault(s.item_id, {"item_id": s.item_id, "title": s.title, "url": ""})
@@ -50,8 +55,9 @@ def score_trending(
     surviving = [
         c for c in candidates.values()
         if _passes_predicate(
-            c.get("watch_count"),
+            c.get("sold_quantity"),
             c.get("sold_rate"),
+            c.get("keyword_rank"),
             c.get("last_sold"),
             c.get("fetched_at"),
             now,
@@ -71,22 +77,22 @@ def score_trending(
             c["keyword_raw"] = float((max_rank + 1) - c["keyword_rank"])
         else:
             c["keyword_raw"] = None
-        c.setdefault("watch_count", None)
+        c.setdefault("sold_quantity", None)
         c.setdefault("sold_rate", None)
 
     # Step 3 — min-max normalize each signal independently
-    kw_norms    = _min_max([c["keyword_raw"] for c in surviving])
-    watch_norms = _min_max([c.get("watch_count") for c in surviving])
-    sold_norms  = _min_max([c.get("sold_rate")   for c in surviving])
+    kw_norms     = _min_max([c["keyword_raw"]      for c in surviving])
+    volume_norms = _min_max([c.get("sold_quantity") for c in surviving])
+    sold_norms   = _min_max([c.get("sold_rate")     for c in surviving])
 
     # Step 4 — weighted sum
     for i, c in enumerate(surviving):
         c["norm_keyword"] = kw_norms[i]
-        c["norm_watch"]   = watch_norms[i]
+        c["norm_volume"]  = volume_norms[i]
         c["norm_sold"]    = sold_norms[i]
         c["score"] = (
             KEYWORD_WEIGHT * c["norm_keyword"]
-            + WATCH_WEIGHT * c["norm_watch"]
+            + VOLUME_WEIGHT * c["norm_volume"]
             + SOLD_WEIGHT  * c["norm_sold"]
         )
 
@@ -94,7 +100,7 @@ def score_trending(
     surviving.sort(
         key=lambda c: (
             -c["score"],
-            -(c.get("watch_count") or 0),
+            -(c.get("sold_quantity") or 0),
             c["item_id"],
         )
     )
@@ -108,12 +114,12 @@ def score_trending(
             source       = "eBay",
             rank         = i,
             score        = c["score"],
-            keyword_rank = c.get("keyword_rank"),
-            watch_count  = c.get("watch_count"),
-            sold_rate    = c.get("sold_rate"),
-            norm_keyword = c["norm_keyword"],
-            norm_watch   = c["norm_watch"],
-            norm_sold    = c["norm_sold"],
+            keyword_rank  = c.get("keyword_rank"),
+            sold_quantity = c.get("sold_quantity"),
+            sold_rate     = c.get("sold_rate"),
+            norm_keyword  = c["norm_keyword"],
+            norm_volume   = c["norm_volume"],
+            norm_sold     = c["norm_sold"],
         ))
     return items
 
@@ -141,18 +147,20 @@ def _min_max(values: list) -> list[float]:
 
 
 def _passes_predicate(
-    watch_count,
+    sold_quantity,
     sold_rate,
+    keyword_rank,
     last_sold,
     fetched_at,
     now: datetime,
     lookback_days: int = 60,
 ) -> bool:
     """Return True if the candidate passes all three predicate gates."""
-    # Gate 1: noise gate — drop if both engagement signals are zero/absent
-    wc = watch_count or 0
+    # Gate 1: noise gate — drop only if there is no positive signal at all
+    # (no units sold, zero sell-through, and not surfaced by Best Match search).
+    sq = sold_quantity or 0
     sr = sold_rate or 0.0
-    if wc == 0 and sr == 0.0:
+    if sq == 0 and sr == 0.0 and keyword_rank is None:
         return False
 
     # Gate 2: recency gate — must have activity within lookback_days
@@ -164,7 +172,7 @@ def _passes_predicate(
             return False
 
     # Gate 3: data-presence gate — must have at least one signal present
-    return (watch_count is not None) or (sold_rate is not None)
+    return (sold_quantity is not None) or (sold_rate is not None) or (keyword_rank is not None)
 
 
 # ── Orchestration helper ──────────────────────────────────────────────────────
@@ -197,10 +205,10 @@ def _fetch_and_cache(provider, client, lookback_days: int) -> list[TrendingItem]
     try:
         kw  = provider.fetch_keyword_signals(lookback_days)
         ids = [k.item_id for k in kw if k.item_id]
-        w   = provider.fetch_watch_signals(ids, lookback_days)
+        v   = provider.fetch_volume_signals(ids, lookback_days)
         s   = provider.fetch_sold_signals(ids, lookback_days)
-        items = score_trending(kw, w, s)
-        trending_cache.save(client, items, kw, w, s)
+        items = score_trending(kw, v, s)
+        trending_cache.save(client, items, kw, v, s)
         return items
     finally:
         trending_cache.release_lock(client)
@@ -213,9 +221,9 @@ def _maybe_refresh(provider, client, lookback_days: int) -> None:
         try:
             kw  = provider.fetch_keyword_signals(lookback_days)
             ids = [k.item_id for k in kw if k.item_id]
-            w   = provider.fetch_watch_signals(ids, lookback_days)
+            v   = provider.fetch_volume_signals(ids, lookback_days)
             s   = provider.fetch_sold_signals(ids, lookback_days)
-            items = score_trending(kw, w, s)
-            trending_cache.save(client, items, kw, w, s)
+            items = score_trending(kw, v, s)
+            trending_cache.save(client, items, kw, v, s)
         finally:
             trending_cache.release_lock(client)

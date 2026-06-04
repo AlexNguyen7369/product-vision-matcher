@@ -8,12 +8,12 @@ from datetime import datetime, timezone
 
 import redis as _redis
 
-from models import KeywordSignal, SoldSignal, TrendingItem, WatchSignal
+from models import KeywordSignal, SoldSignal, TrendingItem, VolumeSignal
 
 log = logging.getLogger(__name__)
 
 REDIS_URL             = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-SCHEMA_VER            = "v1"
+SCHEMA_VER            = "v2"               # bumped: signal model changed (Browse API)
 TTL_SECONDS           = 3 * 60 * 60       # 3 hours
 REFRESH_FLOOR_SECONDS = 15 * 60            # warm-refresh when remaining TTL < 15 min
 LOCK_TTL_SECONDS      = 60                 # lock self-expires so a crash can't wedge it
@@ -59,16 +59,17 @@ def _json_to_items(raw: str) -> list[TrendingItem]:
 
 def _signals_to_json(
     kw: list[KeywordSignal],
-    watch: list[WatchSignal],
+    volume: list[VolumeSignal],
     sold: list[SoldSignal],
 ) -> str:
     def kw_row(k: KeywordSignal) -> dict:
         return {"item_id": k.item_id, "keyword": k.keyword, "rank": k.rank,
+                "title": k.title, "url": k.url,
                 "fetched_at": _dt_to_str(k.fetched_at)}
 
-    def w_row(w: WatchSignal) -> dict:
-        return {"item_id": w.item_id, "title": w.title, "watch_count": w.watch_count,
-                "fetched_at": _dt_to_str(w.fetched_at)}
+    def v_row(v: VolumeSignal) -> dict:
+        return {"item_id": v.item_id, "title": v.title, "sold_quantity": v.sold_quantity,
+                "fetched_at": _dt_to_str(v.fetched_at)}
 
     def s_row(s: SoldSignal) -> dict:
         return {"item_id": s.item_id, "title": s.title, "sold_count": s.sold_count,
@@ -78,7 +79,7 @@ def _signals_to_json(
 
     return json.dumps({
         "keyword_signals": [kw_row(k) for k in kw],
-        "watch_signals":   [w_row(w)  for w in watch],
+        "volume_signals":  [v_row(v)  for v in volume],
         "sold_signals":    [s_row(s)  for s in sold],
     })
 
@@ -106,16 +107,16 @@ def save(
     client: _redis.Redis,
     items: list[TrendingItem],
     keyword_signals: list[KeywordSignal],
-    watch_signals:   list[WatchSignal],
+    volume_signals:  list[VolumeSignal],
     sold_signals:    list[SoldSignal],
     marketplace: str = "ebay",
 ) -> None:
-    """SET trending:ebay:v1:ranked and trending:ebay:v1:raw, both with TTL_SECONDS."""
+    """SET trending:ebay:<ver>:ranked and :raw, both with TTL_SECONDS."""
     try:
         client.set(_key("ranked", marketplace), _items_to_json(items), ex=TTL_SECONDS)
         client.set(
             _key("raw", marketplace),
-            _signals_to_json(keyword_signals, watch_signals, sold_signals),
+            _signals_to_json(keyword_signals, volume_signals, sold_signals),
             ex=TTL_SECONDS,
         )
     except Exception:

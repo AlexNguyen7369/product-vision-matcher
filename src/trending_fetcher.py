@@ -1,190 +1,214 @@
 from __future__ import annotations
 
+import base64
 import os
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
 
-from models import KeywordSignal, SoldSignal, WatchSignal
+from models import KeywordSignal, SoldSignal, VolumeSignal
 
-_MERCH_URL   = "https://svcs.ebay.com/MerchandisingService"
-_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
+# Modern, non-deprecated eBay Buy APIs.
+_OAUTH_URL    = "https://api.ebay.com/identity/v1/oauth2/token"
+_BROWSE_BASE  = "https://api.ebay.com/buy/browse/v1"
+_SCOPE        = "https://api.ebay.com/oauth/api_scope"   # public scope; client-credentials grant
+_MARKETPLACE  = "EBAY_US"
+
+# Seed queries used to discover candidate items via Best Match search. Best Match
+# ordering is eBay's relevance/popularity ranking, so an item's position within a
+# seed query is treated as its trending rank. Override via the constructor.
+DEFAULT_SEED_QUERIES = [
+    "electronics", "sneakers", "trading cards", "video games",
+    "watches", "collectibles", "home", "toys",
+]
 
 
 class EbayTrendingProvider:
-    """Trending-items backend backed by eBay Merchandising + Finding APIs.
+    """Trending-items backend backed by the eBay **Browse API** (modern REST).
 
-    Implements the TrendingProvider protocol (see models.py).
-    app_id and HTTP client are injected so the provider can be unit-tested
-    offline with an httpx.MockTransport — no network required in tests.
+    Implements the TrendingProvider protocol (see models.py). Auth uses the
+    OAuth 2.0 *client-credentials* grant (application token) — only
+    ``EBAY_CLIENT_ID`` + ``EBAY_CLIENT_SECRET`` are required; no RuName / user
+    consent is needed for public Browse search.
+
+    Signals (all from Browse, no special access):
+      - keyword/rank  ← ``item_summary/search`` Best Match position per seed query
+      - sold volume   ← ``getItem`` ``estimatedSoldQuantity``
+      - sell-through  ← sold / (sold + ``estimatedAvailableQuantity``)
+
+    Credentials and the HTTP client are injected so the provider can be
+    unit-tested offline with an ``httpx.MockTransport`` — no network in tests.
     """
 
     def __init__(
         self,
-        app_id: str | None = None,
+        client_id: str | None = None,       # None → fall back to EBAY_CLIENT_ID env var
+        client_secret: str | None = None,   # None → fall back to EBAY_CLIENT_SECRET env var
         client: httpx.Client | None = None,
         timeout: float = 30.0,
-        max_results: int = 50,
+        max_results: int = 10,              # results pulled per seed query
+        seed_queries: list[str] | None = None,
+        marketplace: str = _MARKETPLACE,
     ) -> None:
-        self._app_id     = app_id  # None → fall back to env var in _validate_key()
-        self._client     = client
-        self._timeout    = timeout
-        self._max_results = max_results
+        self._client_id     = client_id
+        self._client_secret = client_secret
+        self._client        = client
+        self._timeout       = timeout
+        self._max_results   = max_results
+        self._seeds         = seed_queries or DEFAULT_SEED_QUERIES
+        self._marketplace   = marketplace
+        self._token: str | None = None
+        # Memoize getItem responses so volume + sold signals share one call each.
+        self._item_cache: dict[str, dict | None] = {}
 
     # ── protocol methods ──────────────────────────────────────────────────────
 
     def fetch_keyword_signals(self, lookback_days: int) -> list[KeywordSignal]:
-        """Call getMostWatchedItems; treat list position as keyword rank."""
+        """Search each seed query (Best Match); list position = trending rank.
+
+        Items appearing under more than one seed keep their best (lowest) rank.
+        """
         self._validate_key()
-        params = {
-            "OPERATION-NAME":       "getMostWatchedItems",
-            "SERVICE-VERSION":      "1.1.0",
-            "CONSUMER-ID":          self._resolved_app_id(),
-            "RESPONSE-DATA-FORMAT": "JSON",
-            "maxResults":           str(self._max_results),
-        }
-        data = self._get(_MERCH_URL, params)
-        now  = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        best: dict[str, KeywordSignal] = {}
 
-        items = (
-            data.get("getMostWatchedItemsResponse", [{}])[0]
-                .get("itemRecommendations", [{}])[0]
-                .get("item", [])
-        )
+        for seed in self._seeds:
+            data = self._get(
+                f"{_BROWSE_BASE}/item_summary/search",
+                params={"q": seed, "limit": str(self._max_results)},
+            )
+            for pos, item in enumerate(data.get("itemSummaries") or [], start=1):
+                item_id = item.get("itemId", "")
+                if not item_id:
+                    continue
+                if item_id not in best or pos < best[item_id].rank:
+                    best[item_id] = KeywordSignal(
+                        item_id    = item_id,
+                        keyword    = seed,
+                        rank       = pos,
+                        fetched_at = now,
+                        title      = item.get("title", ""),
+                        url        = item.get("itemWebUrl", ""),
+                    )
+        return list(best.values())
 
-        signals: list[KeywordSignal] = []
-        for rank, item in enumerate(items, start=1):
-            item_id = item.get("itemId", [""])[0] if isinstance(item.get("itemId"), list) else item.get("itemId", "")
-            keyword = item.get("title", [""])[0] if isinstance(item.get("title"), list) else item.get("title", "")
-            signals.append(KeywordSignal(
-                item_id    = str(item_id),
-                keyword    = str(keyword),
-                rank       = rank,
-                fetched_at = now,
-            ))
-        return signals
-
-    def fetch_watch_signals(
+    def fetch_volume_signals(
         self, item_ids: list[str], lookback_days: int
-    ) -> list[WatchSignal]:
-        """Call getMostWatchedItems; extract watch counts."""
+    ) -> list[VolumeSignal]:
+        """getItem per candidate → estimatedSoldQuantity (units sold)."""
         self._validate_key()
-        params = {
-            "OPERATION-NAME":       "getMostWatchedItems",
-            "SERVICE-VERSION":      "1.1.0",
-            "CONSUMER-ID":          self._resolved_app_id(),
-            "RESPONSE-DATA-FORMAT": "JSON",
-            "maxResults":           str(self._max_results),
-        }
-        data = self._get(_MERCH_URL, params)
-        now  = datetime.now(tz=timezone.utc)
-
-        items = (
-            data.get("getMostWatchedItemsResponse", [{}])[0]
-                .get("itemRecommendations", [{}])[0]
-                .get("item", [])
-        )
-
-        signals: list[WatchSignal] = []
-        for item in items:
-            item_id = item.get("itemId", [""])[0] if isinstance(item.get("itemId"), list) else item.get("itemId", "")
-            title   = item.get("title", [""])[0]   if isinstance(item.get("title"), list)   else item.get("title", "")
-            wc_raw  = item.get("watchCount", ["0"])[0] if isinstance(item.get("watchCount"), list) else item.get("watchCount", "0")
-            signals.append(WatchSignal(
-                item_id     = str(item_id),
-                title       = str(title),
-                watch_count = int(wc_raw),
-                fetched_at  = now,
+        now = datetime.now(tz=timezone.utc)
+        signals: list[VolumeSignal] = []
+        for item_id in item_ids:
+            detail = self._item_detail(item_id)
+            if detail is None:
+                continue
+            sold, _avail = self._quantities(detail)
+            signals.append(VolumeSignal(
+                item_id       = item_id,
+                title         = detail.get("title", ""),
+                sold_quantity = sold,
+                fetched_at    = now,
             ))
         return signals
 
     def fetch_sold_signals(
         self, item_ids: list[str], lookback_days: int
     ) -> list[SoldSignal]:
-        """Call findCompletedItems for each candidate; compute sold_rate."""
-        from datetime import timedelta
-
+        """getItem per candidate → sell-through = sold / (sold + available)."""
         self._validate_key()
-        now      = datetime.now(tz=timezone.utc)
-        end_from = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
+        now = datetime.now(tz=timezone.utc)
         signals: list[SoldSignal] = []
-        keywords_to_query = item_ids[:20] if item_ids else ["electronics"]
-
-        for keyword in keywords_to_query:
-            params = {
-                "OPERATION-NAME":          "findCompletedItems",
-                "SERVICE-VERSION":         "1.13.0",
-                "SECURITY-APPNAME":        self._resolved_app_id(),
-                "RESPONSE-DATA-FORMAT":    "JSON",
-                "keywords":                keyword,
-                "itemFilter(0).name":      "EndTimeFrom",
-                "itemFilter(0).value":     end_from,
-                "itemFilter(1).name":      "SoldItemsOnly",
-                "itemFilter(1).value":     "true",
-                "paginationInput.entriesPerPage": "100",
-            }
-            try:
-                data = self._get(_FINDING_URL, params)
-            except RuntimeError:
+        for item_id in item_ids:
+            detail = self._item_detail(item_id)
+            if detail is None:
                 continue
-
-            search_result = (
-                data.get("findCompletedItemsResponse", [{}])[0]
-                    .get("searchResult", [{}])[0]
-            )
-            raw_items = search_result.get("item", [])
-            total  = int(search_result.get("@count", len(raw_items)))
-            sold   = sum(
-                1 for it in raw_items
-                if (it.get("sellingStatus", [{}])[0].get("sellingState", [""])[0] == "EndedWithSales"
-                    if isinstance(it.get("sellingStatus"), list)
-                    else it.get("sellingStatus", {}).get("sellingState") == "EndedWithSales")
-            )
-            last_sold: datetime | None = None
-            for it in raw_items:
-                end_time_raw = (
-                    it.get("listingInfo", [{}])[0].get("endTime", [""])[0]
-                    if isinstance(it.get("listingInfo"), list)
-                    else it.get("listingInfo", {}).get("endTime", "")
-                )
-                if end_time_raw:
-                    try:
-                        ts = datetime.fromisoformat(end_time_raw.replace("Z", "+00:00"))
-                        if last_sold is None or ts > last_sold:
-                            last_sold = ts
-                    except ValueError:
-                        pass
-
+            sold, avail = self._quantities(detail)
+            total = sold + avail
             signals.append(SoldSignal(
-                item_id     = keyword,
-                title       = keyword,
+                item_id     = item_id,
+                title       = detail.get("title", ""),
                 sold_count  = sold,
                 total_count = total,
-                sold_rate   = sold / total if total > 0 else 0.0,
-                last_sold   = last_sold,
+                sold_rate   = (sold / total) if total > 0 else 0.0,
+                last_sold   = None,   # Browse exposes no per-sale timestamps
                 fetched_at  = now,
             ))
-
         return signals
 
     # ── internals ─────────────────────────────────────────────────────────────
 
-    def _resolved_app_id(self) -> str:
-        if self._app_id is None:
-            return os.environ.get("EBAY_APP_ID", "")
-        return self._app_id
+    def _resolved(self, value: str | None, env_var: str) -> str:
+        return os.environ.get(env_var, "") if value is None else value
+
+    def _resolved_client_id(self) -> str:
+        return self._resolved(self._client_id, "EBAY_CLIENT_ID")
+
+    def _resolved_client_secret(self) -> str:
+        return self._resolved(self._client_secret, "EBAY_CLIENT_SECRET")
 
     def _validate_key(self) -> None:
-        if not self._resolved_app_id():
-            raise EnvironmentError("EBAY_APP_ID not set in .env")
+        if not self._resolved_client_id() or not self._resolved_client_secret():
+            raise EnvironmentError("EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not set in .env")
 
-    def _get(self, url: str, params: dict) -> dict:
+    def _get_token(self) -> str:
+        """Mint (and cache) an application access token via client-credentials."""
+        if self._token:
+            return self._token
+        self._validate_key()
+        creds = base64.b64encode(
+            f"{self._resolved_client_id()}:{self._resolved_client_secret()}".encode()
+        ).decode()
+        data = self._request(
+            "POST", _OAUTH_URL,
+            data={"grant_type": "client_credentials", "scope": _SCOPE},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {creds}",
+            },
+        )
+        token = data.get("access_token")
+        if not token:
+            raise RuntimeError(f"eBay OAuth: no access_token in response: {str(data)[:300]}")
+        self._token = token
+        return token
+
+    def _item_detail(self, item_id: str) -> dict | None:
+        """getItem with per-instance memoization; None if the item 404s/errors."""
+        if item_id in self._item_cache:
+            return self._item_cache[item_id]
+        try:
+            detail = self._get(f"{_BROWSE_BASE}/item/{quote(item_id, safe='')}")
+        except RuntimeError:
+            detail = None
+        self._item_cache[item_id] = detail
+        return detail
+
+    @staticmethod
+    def _quantities(detail: dict) -> tuple[int, int]:
+        """Pull (sold, available) from the first estimatedAvailabilities entry."""
+        avails = detail.get("estimatedAvailabilities") or []
+        first = avails[0] if avails else {}
+        sold  = int(first.get("estimatedSoldQuantity") or 0)
+        avail = int(first.get("estimatedAvailableQuantity") or 0)
+        return sold, avail
+
+    def _get(self, url: str, params: dict | None = None) -> dict:
+        return self._request(
+            "GET", url, params=params,
+            headers={
+                "Authorization": f"Bearer {self._get_token()}",
+                "X-EBAY-C-MARKETPLACE-ID": self._marketplace,
+            },
+        )
+
+    def _request(self, method: str, url: str, **kwargs) -> dict:
         if self._client:
-            resp = self._client.get(url, params=params)
+            resp = self._client.request(method, url, **kwargs)
         else:
             with httpx.Client(timeout=self._timeout) as c:
-                resp = c.get(url, params=params)
+                resp = c.request(method, url, **kwargs)
         if resp.status_code != 200:
             raise RuntimeError(f"eBay {resp.status_code}: {resp.text[:300]}")
         return resp.json()

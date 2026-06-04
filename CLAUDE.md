@@ -18,7 +18,14 @@ python src/test_setup.py
 Requires a `.env` file in the project root with:
 ```
 SERPAPI_KEY=<your_key>
+
+# Trending feature (eBay Browse API, OAuth client-credentials):
+EBAY_CLIENT_ID=<your_ebay_client_id>
+EBAY_CLIENT_SECRET=<your_ebay_client_secret>
+REDIS_URL=redis://localhost:6379/0
 ```
+`EBAY_RUNAME` is **not** required — the Browse API is reached with an application
+token (client-credentials grant), which needs only the Client ID + Secret.
 
 ## Architecture
 

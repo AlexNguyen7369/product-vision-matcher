@@ -51,27 +51,29 @@ class ReverseSearchProvider(Protocol):
 @dataclass
 class KeywordSignal:
     item_id:    str       # eBay itemId this keyword maps to (or "" for pure-keyword rows)
-    keyword:    str       # the trending search term / category label
-    rank:       int       # 1 = most trending; lower is stronger
+    keyword:    str       # the seed search term / category that surfaced this item
+    rank:       int       # Best Match position within its seed query; 1 = top, lower is stronger
     fetched_at: datetime  # when this signal was pulled (UTC)
+    title:      str = ""  # item display title from the search result
+    url:        str = ""  # itemWebUrl from the search result
 
 
 @dataclass
-class WatchSignal:
-    item_id:     str       # eBay itemId
-    title:       str       # item display title
-    watch_count: int       # raw watch count from getMostWatchedItems
-    fetched_at:  datetime  # UTC
+class VolumeSignal:
+    item_id:       str       # eBay itemId
+    title:         str       # item display title
+    sold_quantity: int       # estimatedSoldQuantity from Browse getItem (units sold)
+    fetched_at:    datetime  # UTC
 
 
 @dataclass
 class SoldSignal:
     item_id:     str            # eBay itemId
     title:       str            # item display title
-    sold_count:  int            # number of completed-with-sale listings in the window
-    total_count: int            # total completed listings in the window (sold + unsold)
-    sold_rate:   float          # sold_count / total_count, in [0.0, 1.0]; 0.0 if total_count == 0
-    last_sold:   datetime | None  # most recent sale within the window; None if no sales
+    sold_count:  int            # estimatedSoldQuantity (units sold) from Browse getItem
+    total_count: int            # estimatedSoldQuantity + estimatedAvailableQuantity
+    sold_rate:   float          # sell-through = sold_count / total_count, in [0.0, 1.0]; 0.0 if total_count == 0
+    last_sold:   datetime | None  # unused by the Browse backend (no per-sale timestamps); always None
     fetched_at:  datetime       # UTC
 
 
@@ -86,11 +88,11 @@ class TrendingItem:
     rank:          int          # final position in the trending list, 1 (top) – 10
     score:         float        # final weighted score (un-normalized sum of weighted norms)
     keyword_rank:  int | None   # None when the keyword signal was missing
-    watch_count:   int | None   # None when the watch signal was missing
-    sold_rate:     float | None # None when the sold signal was missing
+    sold_quantity: int | None   # units sold (estimatedSoldQuantity); None when missing
+    sold_rate:     float | None # sell-through; None when the sold signal was missing
     norm_keyword:  float        # 0.0 when signal missing (graceful degradation)
-    norm_watch:    float
-    norm_sold:     float
+    norm_volume:   float        # normalized sold_quantity
+    norm_sold:     float        # normalized sell-through
 
 
 class TrendingProvider(Protocol):
@@ -103,9 +105,9 @@ class TrendingProvider(Protocol):
 
     def fetch_keyword_signals(self, lookback_days: int) -> list[KeywordSignal]: ...
 
-    def fetch_watch_signals(
+    def fetch_volume_signals(
         self, item_ids: list[str], lookback_days: int
-    ) -> list[WatchSignal]: ...
+    ) -> list[VolumeSignal]: ...
 
     def fetch_sold_signals(
         self, item_ids: list[str], lookback_days: int
