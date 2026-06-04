@@ -11,6 +11,187 @@
 > **Scope:** Development feature. eBay only for the first cut; built behind a
 > provider protocol so other marketplaces drop in later.
 
+---
+
+## 0. Change Log — Legacy APIs → Browse API (schema **v1 → v2**)
+
+> **Read this first.** This section is the authoritative summary of *what changed
+> and why* between the **original** implementation (deprecated Merchandising +
+> Finding APIs) and the **current** implementation (modern Browse API). Where a
+> later section still shows the old shape, this section overrides it; the
+> superseded sections are mapped in **§0.7**.
+
+### 0.1 Why the rewrite
+
+The feature originally pulled its three signals from two **legacy** eBay APIs:
+
+- **Merchandising API** `getMostWatchedItems` — keyword rank + watch counts.
+- **Finding API** `findCompletedItems` — sold/completed-listing rate.
+
+Both have since been **deprecated and retired** by eBay. `findCompletedItems`
+(sold-completed data) was access-restricted then shut off for general apps, and
+the Merchandising/Finding services were sunset. The credentials a developer is
+issued today (`EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET`, optionally `EBAY_RUNAME`)
+are **OAuth keys for the modern REST APIs**, not the old App-ID query-key the
+legacy services used.
+
+The feature was therefore migrated to the **Browse API** (`buy/browse/v1`), which
+is current, non-deprecated, and reachable with exactly those OAuth credentials.
+Because the Browse API exposes **no watch-count and no completed-sales** data, the
+*watch* signal was redefined as **sold volume** and the *sold-rate* signal as
+**sell-through** — both derived from data Browse *does* expose
+(`estimatedSoldQuantity` / `estimatedAvailableQuantity`).
+
+### 0.2 Before → after at a glance
+
+| Concern | **Old (v1)** | **New (v2)** |
+| ------- | ------------ | ------------ |
+| **Auth** | App ID as a query param (`CONSUMER-ID` / `SECURITY-APPNAME`); no token | OAuth 2.0 **client-credentials** → application Bearer token, cached on the provider |
+| **Credentials** | `EBAY_APP_ID` | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` (RuName **not** used) |
+| **Host** | `svcs.ebay.com` (legacy SOAP/XML-ish) | `api.ebay.com/buy/browse/v1` (REST/JSON) + `api.ebay.com/identity/v1/oauth2/token` |
+| **Signal 1 — rank** | `getMostWatchedItems` list position | `item_summary/search` **Best Match** position per seed query |
+| **Signal 2 — engagement** | `watchCount` (watch count) | **`estimatedSoldQuantity`** (units sold) via `getItem` |
+| **Signal 3 — demand** | `findCompletedItems` sold/total **completed** rate | **sell-through** = `sold / (sold + available)` via `getItem` |
+| **Weights** | `2 / 2 / 1` (keyword / watch / sold) | `2 / 2 / 1` (keyword / **volume** / sell-through) — unchanged ratio |
+| **Cache schema** | `trending:ebay:**v1**:*` | `trending:ebay:**v2**:*` (model changed → key bump) |
+| **Tests** | 119 passed | **127 passed, 0 failed** (net +8 checks, see §0.6) |
+
+### 0.3 New-version architecture (data flow)
+
+The module boundaries are **unchanged** — only the network layer
+(`trending_fetcher.py`) and the signal shapes were reworked. Fetcher → scorer →
+cache → Flask → UI all still hold.
+
+```
+GET /trending (server.py)
+        │
+        ▼
+trending_cache.load()  ──hit (TTL>0)──►  return cached list[TrendingItem]
+        │                                 (+ warm-refresh if TTL < 15 min, §7.2)
+        │ miss / expired
+        ▼
+trending_fetcher.EbayTrendingProvider          (implements TrendingProvider)
+   1. _get_token()              ─► POST identity/v1/oauth2/token   (cached 2h)
+   2. fetch_keyword_signals(60) ─► GET  browse/v1/item_summary/search?q=<seed>
+                                     · iterate DEFAULT_SEED_QUERIES
+                                     · position in Best Match = rank
+                                     · dedupe across seeds, keep best rank
+                                     · KeywordSignal carries title + itemWebUrl
+   3. fetch_volume_signals(ids) ─► GET  browse/v1/item/{id}  → estimatedSoldQuantity
+   4. fetch_sold_signals(ids)   ─► GET  browse/v1/item/{id}  → sold/(sold+available)
+                                     · (3) and (4) share ONE memoized getItem/id
+        │  raw signal lists (KeywordSignal / VolumeSignal / SoldSignal)
+        ▼
+trending_scorer.score_trending()
+   · join by item_id · predicate filter · min-max normalize each signal
+   · score = 2·norm_keyword + 2·norm_volume + 1·norm_sold · sort · top 10
+        │  list[TrendingItem]
+        ▼
+trending_cache.save()  ─► SET trending:ebay:v2:ranked = JSON  EX 10800 (3h)
+                          SET trending:ebay:v2:raw    = JSON  EX 10800
+        │
+        ▼
+index.html — Trending tab renders: # · Title→url · Source · Score · Sold · Sell-through
+```
+
+### 0.4 Change log by file
+
+- **`src/trending_fetcher.py`** — *full rewrite.*
+  - New OAuth client-credentials flow: `_get_token()` mints a Bearer token once and
+    caches it on the instance.
+  - `fetch_keyword_signals` searches a list of **seed queries**
+    (`DEFAULT_SEED_QUERIES`, e.g. *electronics, sneakers, trading cards, …*),
+    treats each item's Best Match position as its rank, and **dedupes across seeds
+    keeping the best (lowest) rank**.
+  - `fetch_volume_signals` / `fetch_sold_signals` both read `getItem`; a per-instance
+    **memoization cache** (`_item_detail`) ensures **one `getItem` call per item**
+    even though two signals consume it.
+  - Item IDs are **URL-encoded** (`v1|123|0` → `v1%7C123%7C0`); a `getItem` 404 /
+    error **skips that candidate** instead of failing the whole fetch.
+  - Constructor now takes `client_id` / `client_secret` (env fallback
+    `EBAY_CLIENT_ID` / `EBAY_CLIENT_SECRET`), `seed_queries`, and `marketplace`;
+    `max_results` default lowered `50 → 10` (per-seed page size). `_validate_key()`
+    requires **both** id and secret.
+
+- **`src/models.py`** — signal shapes.
+  - `KeywordSignal`: **added `title` and `url`** (default `""`) so the ranked output
+    links straight to the live listing.
+  - **`WatchSignal` → `VolumeSignal`**; field **`watch_count` → `sold_quantity`**.
+  - `SoldSignal`: structurally the same, but semantics changed — `sold_count` =
+    units sold, `total_count` = sold + available, `sold_rate` = sell-through,
+    `last_sold` is **always `None`** (Browse has no per-sale timestamps).
+  - `TrendingItem`: **`watch_count` → `sold_quantity`**, **`norm_watch` → `norm_volume`**.
+  - `TrendingProvider`: **`fetch_watch_signals` → `fetch_volume_signals`** (returns
+    `list[VolumeSignal]`).
+
+- **`src/trending_scorer.py`** — wiring + one behavior change + one bug fix.
+  - Constant **`WATCH_WEIGHT` → `VOLUME_WEIGHT`** (still `2.0`); internal
+    `norm_watch` → `norm_volume`, tiebreaker now `sold_quantity` desc.
+  - Candidate join now lifts `title` + `url` off `KeywordSignal`.
+  - **Noise gate relaxed (see §0.5).**
+  - **Bug fix:** `_maybe_refresh()` (warm-refresh path) referenced an undefined
+    variable after the rename — a latent `NameError` that *no test exercised*. Fixed
+    and now covered by a dedicated test.
+
+- **`src/trending_cache.py`** — `SCHEMA_VER` **`v1` → `v2`**; raw-snapshot JSON now
+  serializes `volume_signals` (with `sold_quantity`) and the extra `title`/`url`
+  on keyword rows; `save()` param `watch_signals → volume_signals`.
+
+- **`server.py`** — `/trending` JSON: `watch_count → sold_quantity`,
+  `norm_watch → norm_volume`.
+
+- **`index.html`** — Trending table headers **`Watch → Sold`**, **`Sold rate →
+  Sell-through`**; JS cell `it.watch_count → it.sold_quantity`.
+
+- **`CLAUDE.md`** — `.env` block documents `EBAY_CLIENT_ID` / `EBAY_CLIENT_SECRET`
+  and that `EBAY_RUNAME` is not required.
+
+### 0.5 Behavioral changes worth knowing
+
+- **Noise gate is more permissive.** Old gate dropped an item when
+  `watch_count == 0 AND sold_rate == 0`. Because Browse's `estimatedSoldQuantity`
+  is **often absent/zero**, the new gate also keeps an item if it was **surfaced by
+  Best Match search** (i.e. has a `keyword_rank`). Net effect: appearing in the top
+  search results is itself treated as a trending signal, so the list won't collapse
+  to empty on items that lack sold data. `_passes_predicate` gained a
+  `keyword_rank` parameter to support this.
+- **Sparse sold data is expected.** On live data, some candidates will score on
+  keyword rank alone (volume/sell-through normalize to `0.0` for them). Tune
+  `DEFAULT_SEED_QUERIES` and the weights once real output is observed.
+- **Rate/latency.** One search per seed + one `getItem` per unique candidate, all
+  behind the 3-hour Redis cache, stays well within the default 5,000 calls/day.
+
+### 0.6 Test changes (`src/test_setup.py`, sections 12–16)
+
+Rewrote the trending sections for the new shapes and **added coverage**:
+OAuth token mint-and-cache, missing-`access_token` error, search→`KeywordSignal`
+mapping (incl. title/url), `getItem`→`VolumeSignal` mapping, sell-through math,
+**`getItem` memoization** (volume+sold = 1 call), `getItem` 404-skip, search
+non-200 error, **cross-seed rank dedup**, `KeywordSignal` title/url defaults,
+`_validate_key` missing-secret, **keyword-only candidate survives the noise gate**,
+and the **warm-refresh path** (regression test for the §0.4 bug fix). Result:
+**127 passed, 0 failed** (was 119).
+
+### 0.7 Which sections below are superseded
+
+The sections that follow were written for the **original** design and are kept for
+historical context. Where they conflict with §0, **§0 wins**:
+
+| Section | Status |
+| ------- | ------ |
+| §1 Feature Summary, §3 eBay API Endpoints, Prerequisites | **Updated** to Browse API ✔ |
+| §2 Data-flow diagram | **Superseded** — use the diagram in §0.3 (still shows `getMostWatchedItems` / Finding) |
+| §4 Data Model | **Superseded** — shows `WatchSignal`/`watch_count`/`norm_watch` and `fetch_watch_signals`; see §0.4 for the real shapes |
+| §5 Module Breakdown | **Superseded** — `EbayTrendingProvider` interface, `WATCH_WEIGHT`, and the legacy endpoint descriptions are pre-migration |
+| §6 Scoring Algorithm | **Mostly valid** (normalize → weight → rank is unchanged) but rename `watch → volume`; the worked example's "watch 500" is now "sold_quantity 500" |
+| §7 Caching | **Valid**, except key version is now `v2` not `v1` |
+| §8 Predicate Filters | **Superseded** — noise gate now also keeps keyword-surfaced items (§0.5) |
+| §9 Extensibility | **Valid** (protocol-based design unchanged; substitute `VolumeSignal`) |
+| §10 Flask + UI | **Superseded** — route emits `sold_quantity`/`norm_volume`; UI columns are `Sold`/`Sell-through` |
+| §11 Implementation Order | **Historical** — original build order; commits reflect the migration instead |
+
+---
+
 ## Prerequisites
 
 ### Environment variables (add to `.env`)
