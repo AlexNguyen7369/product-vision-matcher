@@ -48,6 +48,12 @@ def format_report(report: PriceReport) -> str:
 if __name__ == "__main__":
     from reverse_search import SerpApiSearcher
 
+    # Force UTF-8 stdout so listing titles with non-ASCII characters (™, é, CJK)
+    # print on a stock Windows cp1252 console as they do on macOS/Linux.
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if _reconfigure is not None:
+        _reconfigure(encoding="utf-8")
+
     if len(sys.argv) < 2:
         print("Usage: python pipeline.py <image_path>")
         sys.exit(1)

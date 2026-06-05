@@ -2,6 +2,14 @@ import sys
 import tempfile
 import base64
 
+# Force UTF-8 stdout/stderr so the suite runs identically on Windows (default
+# cp1252 console) and macOS/Linux (UTF-8). Without this, the Unicode arrows (→)
+# in the check labels below raise UnicodeEncodeError on a stock Windows console.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        _reconfigure(encoding="utf-8")
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 _passed = 0

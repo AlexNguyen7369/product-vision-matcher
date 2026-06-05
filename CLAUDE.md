@@ -4,16 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Setup
 
-```powershell
-# Activate virtual environment (Windows)
-.venv\Scripts\Activate.ps1
+The codebase is OS-agnostic (uses `pathlib`, `os.path.join`, `tempfile`, and
+list-form `subprocess` — no shell strings or hardcoded separators), so it runs
+unchanged on Windows and macOS/Linux. Only the virtual-environment activation
+command differs:
 
-# Install dependencies
+```powershell
+# Windows (PowerShell)
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+```bash
+# macOS / Linux
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Then, on either OS:
+
+```
+# Install dependencies (pip resolves the right per-OS wheels for torch/faiss/opencv)
 pip install -r requirements.txt
 
 # Verify environment
 python src/test_setup.py
 ```
+
+`.venv/` is git-ignored and platform-specific — never commit it. When moving
+between a Windows and a Mac machine, recreate it locally with the matching
+command above rather than copying the directory across.
 
 Requires a `.env` file in the project root with:
 ```
