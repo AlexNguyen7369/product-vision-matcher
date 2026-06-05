@@ -1,0 +1,18 @@
+# Normalize line endings so the repo is identical on Windows and macOS/Linux.
+# Text files are stored with LF in the repo; Git checks them out natively.
+# This prevents spurious whole-file diffs when switching between machines.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF to run correctly under PowerShell/cmd.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets — never normalize.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.pt binary
+*.pth binary
+*.faiss binary
