@@ -18,10 +18,116 @@ _MARKETPLACE  = "EBAY_US"
 # Seed queries used to discover candidate items via Best Match search. Best Match
 # ordering is eBay's relevance/popularity ranking, so an item's position within a
 # seed query is treated as its trending rank. Override via the constructor.
+#
+# Schema v3 (Precision Filter — Vintage Clothing Category Taxonomy): seeds are now
+# *category-specific* vintage-clothing queries rather than two broad terms. Each
+# seed maps 1:1 to a vintage-clothing category via CATEGORY_SEED_MAP below, so the
+# candidate set arrives pre-grouped by category. With ~30 seeds × 50 results/seed
+# we draw ~1,500 candidates before dedup (target: ~1,000 unique). See
+# notes/trending_feature_arch.md §0.8 for the full design rationale.
 DEFAULT_SEED_QUERIES = [
-    "electronics", "sneakers", "trading cards", "video games",
-    "watches", "collectibles", "home", "toys",
+    # Hoodies & Sweatshirts
+    "boxy hoodie vintage",
+    "oversized crewneck vintage",
+    "vintage zip up hoodie",
+    "vintage pullover hoodie",
+    # Denim
+    "flare jeans vintage",
+    "wide leg jeans vintage",
+    "baggy jeans vintage",
+    "vintage Levi's",
+    "mom jeans vintage",
+    "vintage straight leg jeans",
+    "carpenter jeans vintage",
+    # Tops
+    "vintage band tee",
+    "vintage graphic tee",
+    "vintage oversized t-shirt",
+    "vintage polo shirt",
+    "vintage rugby shirt",
+    "vintage crop top",
+    # Outerwear
+    "vintage varsity jacket",
+    "vintage denim jacket",
+    "vintage leather jacket",
+    "vintage windbreaker",
+    "vintage coach jacket",
+    "vintage bomber jacket",
+    # Pants & Bottoms (non-denim)
+    "vintage cargo pants",
+    "vintage corduroy pants",
+    "vintage track pants",
+    "vintage pleated trousers",
+    # Dresses
+    "vintage slip dress",
+    "vintage mini dress",
+    "vintage maxi dress",
+    "vintage sundress",
+    # Skirts
+    "vintage denim skirt",
+    "vintage mini skirt",
+    "vintage midi skirt",
+    "vintage pleated skirt",
+    # Sets
+    "vintage matching set",
+    "vintage tracksuit",
+    "vintage two piece set",
 ]
+
+# Maps each seed query to its vintage-clothing category. Because every seed is
+# category-specific, the candidate that a seed surfaces inherits that seed's
+# category — this gives natural, query-driven category grouping with no separate
+# classifier. When an item is surfaced by multiple seeds (cross-seed dedup), the
+# category of its best-ranked (lowest-position) seed wins. Referenced by the
+# schema-v3 category-assignment logic; see notes/trending_feature_arch.md §0.8.
+CATEGORY_SEED_MAP: dict[str, str] = {
+    # Hoodies & Sweatshirts
+    "boxy hoodie vintage":        "Hoodies & Sweatshirts",
+    "oversized crewneck vintage": "Hoodies & Sweatshirts",
+    "vintage zip up hoodie":      "Hoodies & Sweatshirts",
+    "vintage pullover hoodie":    "Hoodies & Sweatshirts",
+    # Denim
+    "flare jeans vintage":        "Denim",
+    "wide leg jeans vintage":     "Denim",
+    "baggy jeans vintage":        "Denim",
+    "vintage Levi's":             "Denim",
+    "mom jeans vintage":          "Denim",
+    "vintage straight leg jeans": "Denim",
+    "carpenter jeans vintage":    "Denim",
+    # Tops
+    "vintage band tee":           "Tops",
+    "vintage graphic tee":        "Tops",
+    "vintage oversized t-shirt":  "Tops",
+    "vintage polo shirt":         "Tops",
+    "vintage rugby shirt":        "Tops",
+    "vintage crop top":           "Tops",
+    # Outerwear
+    "vintage varsity jacket":     "Outerwear",
+    "vintage denim jacket":       "Outerwear",
+    "vintage leather jacket":     "Outerwear",
+    "vintage windbreaker":        "Outerwear",
+    "vintage coach jacket":       "Outerwear",
+    "vintage bomber jacket":      "Outerwear",
+    # Pants & Bottoms (non-denim)
+    "vintage cargo pants":        "Pants & Bottoms",
+    "vintage corduroy pants":     "Pants & Bottoms",
+    "vintage track pants":        "Pants & Bottoms",
+    "vintage pleated trousers":   "Pants & Bottoms",
+    # Dresses
+    "vintage slip dress":         "Dresses",
+    "vintage mini dress":         "Dresses",
+    "vintage maxi dress":         "Dresses",
+    "vintage sundress":           "Dresses",
+    # Skirts
+    "vintage denim skirt":        "Skirts",
+    "vintage mini skirt":         "Skirts",
+    "vintage midi skirt":         "Skirts",
+    "vintage pleated skirt":      "Skirts",
+    # Sets
+    "vintage matching set":       "Sets",
+    "vintage tracksuit":          "Sets",
+    "vintage two piece set":      "Sets",
+}
 
 
 class EbayTrendingProvider:
