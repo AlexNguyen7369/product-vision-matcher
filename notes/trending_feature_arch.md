@@ -1,8 +1,46 @@
 # Trending Items — Feature Architecture
 
-> **Status:** Implemented on the modern **eBay Browse API** (OAuth client-credentials).
-> Offline unit tests pass (127 passed, 0 failed). Online integration testing with
-> real `EBAY_CLIENT_ID`/`EBAY_CLIENT_SECRET` and live Redis not yet done.
+> **Status:** Core pipeline (v2) is fully implemented and tested (127 passed, 0 failed).
+> The v3 precision filter (vintage clothing categories, two-pass filtering, per-category
+> scoring) is **designed but not yet implemented**. Online integration testing with real
+> credentials and live Redis has not been done.
+
+---
+
+## What is NOT yet implemented (v3 — see §0.8 for full design)
+
+The v2 pipeline works end-to-end but treats all results as a flat list with no category
+awareness. The following v3 changes are still pending:
+
+- **`models.py`** — add `category: str` field to `TrendingItem` (§0.8.10)
+- **`trending_fetcher.py`** — increase `max_results` from `10` → `50` per seed; tag each
+  `KeywordSignal` with its category from `CATEGORY_SEED_MAP` during `fetch_keyword_signals`
+  (§0.8.5); limit `getItem` calls to top 15 per category instead of all candidates (§0.8.7)
+- **`trending_scorer.py`** — add `CATEGORY_TAXONOMY` + `EXCLUDED_ITEM_TYPES` constants;
+  replace the current noise gate with the two-pass inclusion/exclusion filter (§0.8.3–§0.8.4);
+  change `score_trending` to normalize and rank **within each category** and return a flat
+  category-tagged list instead of a global top-10 (§0.8.8–§0.8.9)
+- **`trending_cache.py`** — bump `SCHEMA_VER` from `"v2"` → `"v3"` (§0.8.11)
+- **`server.py` / `index.html`** — emit `category` field in the JSON response; group rows
+  by category in the UI table (§0.8.9)
+- **`test_setup.py`** — add Section N covering the v3 filter surface (§0.8.12)
+
+**Data flow summary (once v3 is implemented):**
+
+- `fetch_keyword_signals` runs ~30 category-specific seed queries (e.g. `"flare jeans vintage"`,
+  `"boxy hoodie vintage"`) and tags each result with its category via `CATEGORY_SEED_MAP`
+- `fetch_volume_signals` / `fetch_sold_signals` call `getItem` for the top 15 per category only
+- `score_trending` runs two-pass filtering (include if title matches category keywords → exclude
+  if title contains a non-clothing term like `belt`, `shoe`, `bag`) then normalizes and ranks
+  within each category independently — output is a flat `list[TrendingItem]` where each item
+  carries a `category` field and `rank` is within-category
+- Cache stores the result under `trending:ebay:v3:ranked`; UI groups rows by `category`
+
+**Recommended implementation order:** `models.py` → `trending_scorer.py` (pure/offline,
+easiest to test) → `trending_fetcher.py` → `trending_cache.py` → `server.py`/`index.html`
+
+---
+
 > **Migration note:** the original design used the now-deprecated Merchandising
 > (`getMostWatchedItems`) and Finding (`findCompletedItems`) APIs. Those were
 > retired by eBay, so the feature was migrated to the Browse API. The watch-count
@@ -55,6 +93,22 @@ Because the Browse API exposes **no watch-count and no completed-sales** data, t
 | **Weights** | `2 / 2 / 1` (keyword / watch / sold) | `2 / 2 / 1` (keyword / **volume** / sell-through) — unchanged ratio |
 | **Cache schema** | `trending:ebay:**v1**:*` | `trending:ebay:**v2**:*` (model changed → key bump) |
 | **Tests** | 119 passed | **127 passed, 0 failed** (net +8 checks, see §0.6) |
+
+> **Later revision (v2 → v3).** A subsequent precision pass re-scoped the feature
+> from generic trending to **vintage clothing only**, with category-grouped output.
+> The deltas below are layered *on top of* the v2 row above; see **§0.8** for the
+> full design.
+
+| Concern | **v2 (generic trending)** | **v3 (vintage-clothing precision filter)** |
+| ------- | ------------------------- | ------------------------------------------ |
+| **Seeds** | 2 broad terms (`clothes`, `vintage clothing`) | ~30 **category-specific** vintage seeds (`CATEGORY_SEED_MAP`), §0.8 |
+| **Candidate volume** | a few hundred | **top ~1,000** across all seeds (≈30 seeds × ~50 results, pre-dedup) |
+| **Filtering** | noise gate only | **two-pass**: category whitelist (inclusion) → non-clothing blacklist (exclusion), §0.8 |
+| **Grouping** | flat top-10 | **per-category top-N** (e.g. top 5 × 8 categories), §0.8 |
+| **`getItem` budget** | one per unique candidate (hundreds) | **top 15 per category only** (~120 calls), §0.8 |
+| **Normalization** | global min-max | **per-category** min-max (a crop top doesn't compete with flare jeans), §0.8 |
+| **Model** | `TrendingItem` (no category) | `TrendingItem` **+ `category: str`** |
+| **Cache schema** | `trending:ebay:**v2**:*` | `trending:ebay:**v3**:*` (model changed → key bump) |
 
 ### 0.3 New-version architecture (data flow)
 
@@ -189,6 +243,398 @@ historical context. Where they conflict with §0, **§0 wins**:
 | §9 Extensibility | **Valid** (protocol-based design unchanged; substitute `VolumeSignal`) |
 | §10 Flask + UI | **Superseded** — route emits `sold_quantity`/`norm_volume`; UI columns are `Sold`/`Sell-through` |
 | §11 Implementation Order | **Historical** — original build order; commits reflect the migration instead |
+
+> **v3 supersessions (see §0.8).** The precision-filter pass re-scopes several
+> sections beyond the v2 migration:
+>
+> | Section | Status under v3 |
+> | ------- | --------------- |
+> | §1 Feature Summary | **Superseded** — feature is now **vintage clothing**, output is **per-category top-N**, not a flat top-10 (§0.8) |
+> | §3.1 Keyword signal | **Superseded** — the example seeds (`electronics, sneakers, …`) are replaced by the §0.8 category taxonomy; seeds now drive category assignment |
+> | §4 Data Model | **Amended** — `TrendingItem` gains `category: str` (§0.8); other v2 amendments still apply |
+> | §6 Scoring Algorithm | **Amended** — min-max normalization is now **per-category**, not global (§0.8); the join/weight/rank mechanics are otherwise unchanged |
+> | §7 Caching | **Amended** — key version is now **`v3`** (§0.8), e.g. `trending:ebay:v3:ranked` |
+> | §8 Predicate Filters | **Superseded** — the noise gate is replaced by the §0.8 two-pass inclusion/exclusion filter (category whitelist → non-clothing blacklist) |
+> | §10 Flask + UI | **Amended** — the route/UI now emit and render a `category` field and group rows per category (§0.8) |
+
+---
+
+## 0.8  Precision Filter — Vintage Clothing Category Taxonomy (Schema v3)
+
+> **Read §0 first, then this.** This section re-scopes the feature from *generic
+> trending* to **vintage clothing only**, and changes the output from a flat
+> top-10 to **per-category top-N**. Where it conflicts with §1–§10 (and with the
+> v2 deltas in §0.1–§0.7), **§0.8 wins**. The network/auth layer (OAuth, Browse
+> endpoints, the memoized `getItem`) and the module boundaries are **unchanged** —
+> this is a *filtering, grouping, and scoring-scope* change, not a rewrite.
+
+### 0.8.1 Why category-specific seeds beat generic seeds
+
+The v2 design used two broad seeds (`clothes`, `vintage clothing`) and ranked the
+union globally. That has three problems for a vintage-clothing-focused product:
+
+1. **Low precision.** A broad `clothes` Best-Match page is dominated by whatever
+   eBay's relevance model surfaces that day — often new/fast-fashion items, plus
+   non-clothing (belts, bags, shoes) that eBay files under apparel-adjacent
+   categories. There is no signal telling us *what kind* of garment each result is.
+2. **No grouping.** A flat top-10 mixes a hoodie, a pair of jeans, and a dress with
+   no way to browse "show me trending flare jeans." Users of a vintage-clothing
+   tool think in **garment categories**, not a global leaderboard.
+3. **Unfair cross-category competition.** Global min-max normalization makes a
+   high-volume staple (e.g. `vintage Levi's`) crowd out an entire low-volume but
+   genuinely-trending niche (e.g. `vintage crop top`). The popular category wins
+   every slot.
+
+**The fix: make the seed itself the category label.** Each seed is a *specific*
+vintage-garment query (`flare jeans vintage`, `boxy hoodie vintage`, …). Because
+a seed is category-specific, **every candidate it surfaces inherits that seed's
+category for free** — no separate classifier, no ML, no eBay category-ID mapping.
+This is the cheapest possible "classifier": the query *is* the label. Grouping,
+precision, and per-category scoring all fall out of this one decision.
+
+**Trade-offs we accept:**
+
+- A garment can legitimately match multiple seeds (a `vintage denim jacket` also
+  matches `vintage Levi's` if it's Levi's branded). We resolve this with a
+  **best-rank-wins** tie-break (§0.8.5): the category of the seed under which the
+  item ranked highest is assigned. This is deterministic and favors the query the
+  item is *most* relevant to.
+- Seeds are a curated, hand-maintained list. New vintage trends (a new silhouette)
+  require adding a seed + a `CATEGORY_SEED_MAP` entry. We accept manual curation in
+  exchange for precision and zero classifier infrastructure.
+- The query text can still surface off-category noise (a `flare jeans vintage`
+  search may return a belt that mentions "flare"). That residue is caught by the
+  **second-pass exclusion blacklist** (§0.8.4), not by the seed alone.
+
+### 0.8.2 Category taxonomy (`CATEGORY_TAXONOMY`)
+
+Eight categories, each with its seed queries and an **inclusion keyword list** (the
+whitelist a title must hit — see §0.8.4). Seeds live in
+`trending_fetcher.DEFAULT_SEED_QUERIES`; the seed→category map is
+`trending_fetcher.CATEGORY_SEED_MAP`. The inclusion keywords are a scorer-side
+concern (proposed `trending_scorer.CATEGORY_TAXONOMY`); they are listed here so the
+two halves stay in sync.
+
+```python
+# Proposed structure (scorer-side). Seeds mirror CATEGORY_SEED_MAP in the fetcher.
+CATEGORY_TAXONOMY = {
+    "Hoodies & Sweatshirts": {
+        "seeds": [
+            "boxy hoodie vintage", "oversized crewneck vintage",
+            "vintage zip up hoodie", "vintage pullover hoodie",
+        ],
+        # title must contain >= 1 of these (case-insensitive substring)
+        "include": ["hoodie", "hooded", "sweatshirt", "crewneck", "crew neck",
+                    "pullover", "sweater", "jumper"],
+    },
+    "Denim": {
+        "seeds": [
+            "flare jeans vintage", "wide leg jeans vintage", "baggy jeans vintage",
+            "vintage Levi's", "mom jeans vintage", "vintage straight leg jeans",
+            "carpenter jeans vintage",
+        ],
+        "include": ["jeans", "denim", "levi", "levis", "wrangler", "lee",
+                    "flare", "bootcut", "baggy", "mom jean", "carpenter"],
+        # NOTE: "denim jacket"/"denim skirt" titles are claimed by Outerwear/Skirts
+        # respectively via best-rank-wins (§0.8.5), not double-counted here.
+    },
+    "Tops": {
+        "seeds": [
+            "vintage band tee", "vintage graphic tee", "vintage oversized t-shirt",
+            "vintage polo shirt", "vintage rugby shirt", "vintage crop top",
+        ],
+        "include": ["tee", "t-shirt", "tshirt", "t shirt", "shirt", "top",
+                    "polo", "rugby", "blouse", "tank"],
+    },
+    "Outerwear": {
+        "seeds": [
+            "vintage varsity jacket", "vintage denim jacket", "vintage leather jacket",
+            "vintage windbreaker", "vintage coach jacket", "vintage bomber jacket",
+        ],
+        "include": ["jacket", "coat", "windbreaker", "bomber", "varsity",
+                    "parka", "anorak", "blazer", "overcoat"],
+    },
+    "Pants & Bottoms": {          # non-denim trousers
+        "seeds": [
+            "vintage cargo pants", "vintage corduroy pants",
+            "vintage track pants", "vintage pleated trousers",
+        ],
+        "include": ["pants", "trousers", "cargo", "corduroy", "cords",
+                    "chino", "slacks", "track pant"],
+    },
+    "Dresses": {
+        "seeds": [
+            "vintage slip dress", "vintage mini dress",
+            "vintage maxi dress", "vintage sundress",
+        ],
+        "include": ["dress", "sundress", "gown", "frock"],
+    },
+    "Skirts": {
+        "seeds": [
+            "vintage denim skirt", "vintage mini skirt",
+            "vintage midi skirt", "vintage pleated skirt",
+        ],
+        "include": ["skirt", "skort"],
+    },
+    "Sets": {
+        "seeds": [
+            "vintage matching set", "vintage tracksuit", "vintage two piece set",
+        ],
+        "include": ["set", "tracksuit", "two piece", "two-piece", "co-ord",
+                    "coord", "matching set"],
+    },
+}
+```
+
+> **Keyword-list design notes.** Inclusion lists are deliberately *generous*
+> (synonyms, common brand names, hyphen/space variants of the same word) so we
+> don't drop a genuine garment on a wording quirk. Precision is recovered by the
+> exclusion pass (§0.8.4), which is the safer place to be strict: a false
+> *inclusion* merely lets a borderline garment compete within its category, while a
+> false *exclusion* silently deletes a real listing. The two passes are tuned with
+> that asymmetry in mind — **loose include, strict exclude**.
+
+### 0.8.3 Two-pass filtering algorithm
+
+Each candidate (already tagged with a `category` from its best seed, §0.8.5) runs
+through two ordered gates *before* scoring. A candidate must pass **both**.
+
+```
+for each candidate c with assigned category K = c.category:
+    title = c.title.casefold()
+
+    # ── Pass 1: inclusion (category whitelist) ───────────────────────────────
+    # The title must contain >= 1 keyword from K's include-list. This confirms the
+    # item really is the kind of garment the seed promised (the seed surfaced it,
+    # but Best Match can drift). Reject if it matches none.
+    if not any(kw in title for kw in CATEGORY_TAXONOMY[K]["include"]):
+        drop(c); continue
+
+    # ── Pass 2: exclusion (non-clothing blacklist) ───────────────────────────
+    # Drop anything whose title names a non-garment item type, even if it slipped
+    # past Pass 1 (e.g. "leather jacket belt", "denim skirt + matching bag").
+    if any(bad in title for bad in EXCLUDED_ITEM_TYPES):
+        drop(c); continue
+
+    keep(c)
+```
+
+**Ordering rationale.** Inclusion first, exclusion second. Inclusion is the cheap,
+high-selectivity gate (most off-category noise dies here); exclusion is the
+targeted clean-up for accessory contamination that *shares* a garment keyword
+(a "jacket **belt**" passes the `jacket` include but must die on the `belt`
+exclude). Running exclusion second means it always gets the final say.
+
+> **Word-boundary caution.** Naïve substring matching has the classic
+> `"scarf"` ⊂ `"scarface"`, `"ring"` ⊂ `"earring/herringbone"`, `"cap"` ⊂
+> `"capri/escape"` collision risk. The implementation MUST match on **word
+> boundaries** (token/`\b` match, not bare `in`) for the short, collision-prone
+> exclusion terms. The pseudo-code uses `in` for readability only; see the
+> per-term notes in §0.8.4.
+
+### 0.8.4 `EXCLUDED_ITEM_TYPES` (non-clothing blacklist) + rationale
+
+These are item *types* that are not garments (or are accessory categories the
+product intentionally omits). Each is dropped on a **word-boundary** match.
+
+| Excluded term(s) | Why excluded | Edge case / boundary note |
+| ---------------- | ------------ | ------------------------- |
+| `belt` | Accessory, not a garment. | Watch `"belted"` (a coat *can* be belted) — do **not** strip belted dresses/coats; match the standalone noun `belt`/`belts` only, and only when no garment keyword dominates. |
+| `shoe`, `shoes`, `boot`, `boots`, `sneaker`, `sneakers`, `heel`, `heels`, `loafer`, `sandal` | Footwear — explicitly out of scope. | `"bootcut"` (a denim cut) must **not** trip `boot` — word-boundary match is mandatory here. `"heel"` similarly must not hit `"wheeler"`. |
+| `bag`, `purse`, `handbag`, `backpack`, `tote`, `clutch`, `wallet` | Bags/carry goods — accessories. | `"baggy"` (jeans) must **not** trip `bag` — boundary match required. |
+| `hat`, `cap`, `beanie`, `bucket hat`, `visor` | Headwear — accessory. | `"cap"` collides with `capri`, `escape`, `caps` brand tags → boundary match; prefer matching `cap`/`caps`/`baseball cap`. |
+| `scarf`, `scarves`, `bandana`, `gloves`, `mittens` | Cold-weather accessories. | `"scarf"` ⊂ `"scarface"` → boundary match. |
+| `jewelry`, `jewellery`, `necklace`, `bracelet`, `ring`, `earring`, `earrings`, `brooch`, `pin`, `pendant` | Jewelry — accessory. | `"ring"` ⊂ `"earring"`, `"herringbone"`, `"spring"` → boundary match is critical here. Consider dropping bare `ring`/`pin` and relying on `necklace`/`earring`/`bracelet` if collisions prove noisy. |
+| `watch`, `watches` | Timepiece — accessory. | `"watch"` appears in marketing copy ("must-watch"); rare in titles but boundary-match anyway. |
+| `sunglasses`, `glasses`, `eyewear` | Eyewear — accessory. | Low collision risk. |
+| `keychain`, `lanyard`, `patch`, `sticker`, `keyring` | Merch/novelty, not wearable garments. | `"patch"` can appear on a varsity jacket ("chenille **patch**"); if it over-deletes, scope the exclusion to *standalone* patch listings (title starts with / is dominated by `patch`). |
+| `socks`, `sock` | Hosiery accessory, sub-garment; out of scope for the trending grid. | Distinct from `leggings` (see below). |
+| `tights`, `pantyhose`, `stockings`, `nylons` | **Excluded.** Hosiery / undergarment-adjacent — not an outerwear garment people browse as "trending vintage clothing." Closer to socks than to pants. | Contrast with `leggings` below — this is the deliberate edge-case split. |
+
+**The `leggings` decision (deliberately *not* excluded).** `leggings` are a genuine
+outerwear bottom (athleisure/streetwear staple), unlike `tights`/`pantyhose` which
+are hosiery worn *under* other garments. We therefore **keep** `leggings` and
+**exclude** `tights`. To make `leggings` actually rankable rather than orphaned,
+add it to the **Pants & Bottoms** inclusion list (`"leggings"`, `"legging"`) — and,
+if desired, a `"leggings vintage"` seed mapped to that category. The principle: the
+blacklist is for *non-garments and sub-garments worn underneath*, not for "tight"
+silhouettes. `tights` ≈ hosiery → out; `leggings` ≈ trousers → in.
+
+> **General principle for the blacklist.** Exclude an item only when its title's
+> *dominant noun* is a non-garment. A garment that merely *mentions* an accessory
+> ("hoodie with matching beanie", "dress with belt") is still a garment and should
+> survive — which is why the boundary-matched exclusion runs *after* a positive
+> inclusion match, and why ambiguous terms (`patch`, `pin`, `belt`) are scoped to
+> standalone/dominant occurrences rather than any-substring.
+
+### 0.8.5 Category assignment + cross-seed dedup (best-rank-wins)
+
+A single item can surface under multiple seeds (cross-seed dedup already exists in
+`fetch_keyword_signals`, keeping the best/lowest rank). v3 extends that join to
+also carry the **category of the winning seed**:
+
+```
+for each (seed, position, item) in all seed searches:
+    K = CATEGORY_SEED_MAP[seed]
+    if item.id unseen OR position < best[item.id].rank:
+        best[item.id] = {rank: position, category: K, seed: seed, ...}
+# → each unique item ends up tagged with the category of the seed under which it
+#   ranked highest. Deterministic; favors the most-relevant query.
+```
+
+This keeps category assignment free (it rides the existing dedup) and resolves the
+multi-seed ambiguity from §0.8.1 without a tiebreak table.
+
+### 0.8.6 API rate budget
+
+Per refresh cycle:
+
+| Stage | Calls |
+| ----- | ----- |
+| OAuth token mint | ~1 (cached 2h, often 0 on warm cycles) |
+| `item_summary/search` — one per seed | **~30** (1 per seed; was 20 in the original estimate, scaled to the full taxonomy) |
+| `getItem` — **only top 15 per category** (§0.8.7), ~8 categories | **~120** |
+| **Total per refresh** | **~150** |
+
+Cap on refreshes: the 3-hour cache (§7) ⇒ at most **8 refreshes/day**.
+`8 × ~150 ≈ 1,200 calls/day` — comfortably under the default **5,000 calls/day**
+Browse limit, with headroom for the OAuth mint and ad-hoc manual refreshes. The
+dominant cost is `getItem`; §0.8.7 is what keeps it bounded.
+
+> If the taxonomy grows, the budget scales as `seeds + 15×categories` per refresh.
+> Even doubling to ~60 seeds / 16 categories (`60 + 240 = 300`/refresh →
+> `2,400`/day) stays under the cap.
+
+### 0.8.7 `getItem` optimization — top 15 per category only
+
+Naïvely calling `getItem` for every unique candidate (~1,000) would blow the rate
+budget (1,000 × 8 refreshes = 8,000/day > limit) and add latency for items that
+will never make the per-category top-N anyway.
+
+**Optimization:** after the keyword search + dedup + two-pass filter, **sort each
+category's surviving candidates by keyword rank (lowest = best) and fetch `getItem`
+only for the top 15 per category.** Rationale:
+
+- The volume/sell-through signals (`getItem`) only matter for items that are
+  *already* near the top on keyword rank — a candidate ranked #480 in its category
+  isn't going to win a top-5 slot even with perfect sold data.
+- Keyword rank is a strong prior (it's eBay's own Best Match popularity ordering),
+  so the top-15-by-rank pool reliably contains the eventual top-N.
+- This bounds `getItem` at `15 × ~8 = ~120` calls regardless of how many raw
+  candidates we pulled — decoupling the API cost from the 1,000-candidate intake.
+
+Candidates outside the top-15 still appear in the raw snapshot (and can score on
+keyword rank alone if they somehow surface), but they are not enriched with
+sold/volume data. This is the v3 analog of "keyword-surfaced items still count"
+(§0.5), scoped per category.
+
+### 0.8.8 Per-category scoring (normalize within category, not globally)
+
+The v2 scorer min-max normalized each signal **globally** across all candidates.
+v3 normalizes **within each category**:
+
+```
+for each category K:
+    pool = surviving candidates with category == K
+    for each signal (keyword / volume / sell-through):
+        min-max normalize over `pool` only        # NOT over all categories
+    score = 2·norm_keyword + 2·norm_volume + 1·norm_sold   # weights unchanged
+    rank pool by score desc; take top-N (e.g. 5)
+```
+
+**Why per-category.** Global normalization let a high-volume category (e.g. `Denim`,
+where `vintage Levi's` moves huge units) dominate the absolute scale, so a
+genuinely-trending but lower-volume `Tops` item normalized to near-zero and never
+ranked. Normalizing *within* a category means each garment competes only against
+its peers — "is this a trending **crop top**?" is answered relative to other crop
+tops, not relative to Levi's. The **weights (2/2/1) and the min-max mechanics are
+unchanged** (§6); only the *scope* of the min/max bounds changes from global to
+per-category.
+
+> Consequence: scores are **not comparable across categories** (each category's top
+> item scores ~5.0). That's intended — the output is grouped by category, so
+> cross-category score comparison is meaningless. If a future "global trending"
+> view is wanted, keep a second global-normalized pass; don't reinterpret the
+> per-category scores.
+
+### 0.8.9 Output shape — per-category top-N
+
+Output changes from a flat `list[TrendingItem]` (top 10) to **grouped, top-N per
+category**. Two equivalent encodings; pick one and keep the cache/UI consistent:
+
+```python
+# Option A — flat list, every row carries its category (simplest; minimal churn):
+list[TrendingItem]            # each TrendingItem now has .category; rows for all
+                              # categories concatenated, ~N×8 rows. UI groups by
+                              # .category. Scoring/rank are per-category (§0.8.8),
+                              # so .rank is the rank *within* its category.
+
+# Option B — explicit grouping:
+dict[str, list[TrendingItem]] # {"Denim": [...top N...], "Tops": [...], ...}
+```
+
+**Recommendation: Option A** (flat list of category-tagged rows). It is the
+smallest change to the existing `list[TrendingItem]` contract that the cache,
+`/trending` route, and JSON shape already speak — the UI does the grouping
+client-side off `.category`. `rank` becomes the **within-category** rank (1..N per
+category).
+
+### 0.8.10 `TrendingItem` model change (`+ category`)
+
+Add one field to the `TrendingItem` dataclass in `models.py`:
+
+```python
+@dataclass
+class TrendingItem:
+    item_id:  str
+    title:    str
+    url:      str
+    source:   str
+    category: str        # NEW (v3): vintage-clothing category, e.g. "Denim".
+                         # Sourced from the winning seed via CATEGORY_SEED_MAP
+                         # (§0.8.5). Empty "" only for legacy/uncategorized rows.
+    rank:     int        # v3: rank *within* the item's category (1..N), not global
+    score:    float
+    # ... existing raw + norm_* fields unchanged ...
+```
+
+This is a model change, so it **forces a cache key bump** (§0.8.11). The
+`/trending` route and `index.html` add a `category` column / grouping (amends §10).
+
+### 0.8.11 Cache schema bump → `v3`
+
+Per §7.3, any `TrendingItem`/signal field change is a one-line key rename. Adding
+`category` (§0.8.10) ⇒ bump `trending_cache.SCHEMA_VER` from `"v2"` to `"v3"`:
+
+```
+trending:ebay:v3:ranked    # JSON list[TrendingItem] (category-tagged, per-cat top-N)
+trending:ebay:v3:raw       # raw signal snapshot (now includes per-candidate category)
+trending:ebay:v3:lock      # single-flight fetch lock (unchanged mechanics)
+```
+
+Old `v2:*` keys are never read again and expire on their own within the 3-hour TTL
+— no migration, no corrupt-cache branch (§7.3).
+
+### 0.8.12 Test surface (to add in `src/test_setup.py`, when implemented)
+
+Per the Testing Policy, the v3 implementation must add a
+`=== Section N: trending — v3 precision filter ===` block covering at minimum:
+
+- `CATEGORY_SEED_MAP` is total over `DEFAULT_SEED_QUERIES` (every seed maps to a
+  category; every category in `CATEGORY_TAXONOMY` has ≥1 seed) — the two halves
+  stay in sync.
+- Inclusion pass: a title with a category keyword passes; a title with none is
+  dropped.
+- Exclusion pass + word boundaries: `"vintage bootcut jeans"` survives (no `boot`
+  false-positive), `"vintage leather belt"` is dropped, `"baggy jeans"` survives
+  (no `bag` false-positive), `"vintage cargo pants leggings"` survives, a
+  standalone `"vintage tights"` is dropped.
+- `leggings` kept vs `tights` dropped (the deliberate edge case).
+- Best-rank-wins category assignment when an item matches two seeds.
+- Per-category normalization: a low-volume category's top item still normalizes to
+  ~1.0 within its pool (not crushed by a high-volume category).
+- `getItem` is called for ≤15 items per category.
+- Cache round-trips a `category` field and the key carries `v3`.
 
 ---
 
