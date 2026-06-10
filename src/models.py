@@ -56,6 +56,8 @@ class KeywordSignal:
     fetched_at: datetime  # when this signal was pulled (UTC)
     title:      str = ""  # item display title from the search result
     url:        str = ""  # itemWebUrl from the search result
+    category:   str = ""  # v3: vintage-clothing category of the winning seed (CATEGORY_SEED_MAP);
+                          # "" when the surfacing seed has no mapped category (§0.8.5)
 
 
 @dataclass
@@ -93,6 +95,11 @@ class TrendingItem:
     norm_keyword:  float        # 0.0 when signal missing (graceful degradation)
     norm_volume:   float        # normalized sold_quantity
     norm_sold:     float        # normalized sell-through
+    # v3 (§0.8.10): vintage-clothing category, e.g. "Denim". Sourced from the
+    # winning seed via CATEGORY_SEED_MAP (§0.8.5). Defaults "" for legacy/
+    # uncategorized rows. With per-category scoring, `rank` is the rank *within*
+    # this category (1..N), not a global position.
+    category:      str = ""
 
 
 class TrendingProvider(Protocol):

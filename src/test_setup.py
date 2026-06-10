@@ -932,7 +932,12 @@ def check_keyword_signal_fields():
 
 def check_keyword_signal_optional_title_url():
     k = KeywordSignal(item_id="123", keyword="widget", rank=1, fetched_at=_NOW)
-    assert k.title == "" and k.url == ""
+    assert k.title == "" and k.url == "" and k.category == ""
+
+def check_keyword_signal_category():
+    k = KeywordSignal(item_id="123", keyword="flare jeans vintage", rank=1,
+                      fetched_at=_NOW, category="Denim")
+    assert k.category == "Denim"
 
 def check_volume_signal_fields():
     v = VolumeSignal(item_id="456", title="Gadget", sold_quantity=200, fetched_at=_NOW)
@@ -949,9 +954,17 @@ def check_trending_item_fields():
     it = TrendingItem(
         item_id="1", title="T", url="https://x.com", source="eBay",
         rank=1, score=4.5, keyword_rank=1, sold_quantity=100, sold_rate=0.5,
-        norm_keyword=1.0, norm_volume=0.8, norm_sold=0.6,
+        norm_keyword=1.0, norm_volume=0.8, norm_sold=0.6, category="Denim",
     )
-    assert it.rank == 1 and it.score == 4.5
+    assert it.rank == 1 and it.score == 4.5 and it.category == "Denim"
+
+def check_trending_item_category_defaults_empty():
+    it = TrendingItem(
+        item_id="1", title="T", url="", source="eBay", rank=1, score=1.0,
+        keyword_rank=1, sold_quantity=None, sold_rate=None,
+        norm_keyword=1.0, norm_volume=0.0, norm_sold=0.0,
+    )
+    assert it.category == ""
 
 def check_trending_item_optional_none():
     it = TrendingItem(
@@ -963,10 +976,12 @@ def check_trending_item_optional_none():
     assert it.keyword_rank is None and it.sold_quantity is None
 
 run_check("KeywordSignal constructs with correct fields", check_keyword_signal_fields)
-run_check("KeywordSignal title/url default to empty string", check_keyword_signal_optional_title_url)
+run_check("KeywordSignal title/url/category default to empty string", check_keyword_signal_optional_title_url)
+run_check("KeywordSignal carries a v3 category", check_keyword_signal_category)
 run_check("VolumeSignal constructs with correct fields", check_volume_signal_fields)
 run_check("SoldSignal constructs with correct fields (including last_sold)", check_sold_signal_fields)
-run_check("TrendingItem constructs with all fields", check_trending_item_fields)
+run_check("TrendingItem constructs with all fields (incl. category)", check_trending_item_fields)
+run_check("TrendingItem category defaults to empty string", check_trending_item_category_defaults_empty)
 run_check("TrendingItem accepts None for optional signal fields", check_trending_item_optional_none)
 
 # ── section 13: trending_scorer — normalization, filtering, and ranking ───────
