@@ -1657,7 +1657,33 @@ def check_v3_cache_key_carries_v3_and_category():
     loaded, _ = load(r)
     assert loaded[0].category == "Denim"
 
+def check_v3_inclusion_word_boundaries():
+    """Inclusion matches whole words, not substrings — kills latent collisions."""
+    assert not _passes_category_filter("vintage fleece quarter zip", "Denim")   # "lee" not in fleece
+    assert not _passes_category_filter("vintage corset bustier", "Sets")        # "set" not in corset
+    assert not _passes_category_filter("retro laptop sleeve case", "Tops")      # no bare "top"
+    # genuine brand/garment words still match, including plural forms:
+    assert _passes_category_filter("vintage Lee Riders", "Denim")               # "Lee" brand, whole word
+    assert _passes_category_filter("vintage band tees lot of 3", "Tops")        # "tees" plural
+    assert _passes_category_filter("vintage tan chinos", "Pants & Bottoms")     # "chinos" plural
+    assert _passes_category_filter("vintage mom jeans", "Denim")                # "mom jean" + s
+
+def check_v3_tightened_include_lists():
+    """Dropped/refined keywords behave as intended after the precision tuning."""
+    # terms removed for cross-category / non-garment leakage no longer qualify alone:
+    assert not _passes_category_filter("vintage flare maxi dress", "Denim")        # "flare" removed
+    assert not _passes_category_filter("vintage guitar cords bundle", "Pants & Bottoms")  # "cords" removed
+    assert not _passes_category_filter("vintage tabletop lamp", "Tops")            # bare "top" removed
+    # specific top styles that replaced bare "top" still match:
+    assert _passes_category_filter("vintage cropped crop top", "Tops")
+    assert _passes_category_filter("vintage ribbed tank top", "Tops")
+    # compound coats still match Outerwear under word-boundary matching:
+    assert _passes_category_filter("vintage wool peacoat", "Outerwear")
+    assert _passes_category_filter("vintage trench coat", "Outerwear")
+
 run_check("CATEGORY_SEED_MAP is total and in sync with CATEGORY_TAXONOMY", check_v3_seed_map_is_total_and_in_sync)
+run_check("inclusion matches on word boundaries with plural tolerance", check_v3_inclusion_word_boundaries)
+run_check("tightened include lists (flare/cords/top dropped, coats added)", check_v3_tightened_include_lists)
 run_check("inclusion pass: garment keyword passes, off-category dropped", check_v3_inclusion_pass)
 run_check("unknown category is rejected", check_v3_unknown_category_rejected)
 run_check("exclusion pass respects word boundaries (bootcut/baggy survive, belt dropped)", check_v3_exclusion_word_boundaries)

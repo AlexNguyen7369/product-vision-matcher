@@ -46,15 +46,20 @@ CATEGORY_TAXONOMY: dict[str, dict[str, list[str]]] = {
             "vintage Levi's", "mom jeans vintage", "vintage straight leg jeans",
             "carpenter jeans vintage",
         ],
+        # "flare" dropped — it leaks across categories (flare dresses/skirts/
+        # trousers); genuine flare jeans still match on "jeans"/"denim".
         "include": ["jeans", "denim", "levi", "levis", "wrangler", "lee",
-                    "flare", "bootcut", "baggy", "mom jean", "carpenter"],
+                    "bootcut", "baggy", "mom jean", "carpenter"],
     },
     "Tops": {
         "seeds": [
             "vintage band tee", "vintage graphic tee", "vintage oversized t-shirt",
             "vintage polo shirt", "vintage rugby shirt", "vintage crop top",
         ],
-        "include": ["tee", "t-shirt", "tshirt", "t shirt", "shirt", "top",
+        # Bare "top" dropped — too generic; replaced with the specific top styles so
+        # only genuine top-garments match, not every "...top" word.
+        "include": ["tee", "t-shirt", "tshirt", "t shirt", "shirt", "jersey",
+                    "crop top", "tank top", "tube top", "halter top",
                     "polo", "rugby", "blouse", "tank"],
     },
     "Outerwear": {
@@ -62,8 +67,10 @@ CATEGORY_TAXONOMY: dict[str, dict[str, list[str]]] = {
             "vintage varsity jacket", "vintage denim jacket", "vintage leather jacket",
             "vintage windbreaker", "vintage coach jacket", "vintage bomber jacket",
         ],
-        "include": ["jacket", "coat", "windbreaker", "bomber", "varsity",
-                    "parka", "anorak", "blazer", "overcoat"],
+        # Compound coats (peacoat/raincoat/trench) listed explicitly: word-boundary
+        # matching means bare "coat" no longer reaches inside them.
+        "include": ["jacket", "coat", "overcoat", "peacoat", "raincoat", "trench",
+                    "windbreaker", "bomber", "varsity", "parka", "anorak", "blazer"],
     },
     "Pants & Bottoms": {          # non-denim trousers
         "seeds": [
@@ -72,7 +79,9 @@ CATEGORY_TAXONOMY: dict[str, dict[str, list[str]]] = {
         ],
         # "leggings"/"legging" are kept (a genuine outerwear bottom) — see the
         # leggings-vs-tights decision in §0.8.4. "tights" stays on the blacklist.
-        "include": ["pants", "trousers", "cargo", "corduroy", "cords",
+        # "cords" dropped — collides with the non-garment sense (cables) and is
+        # already covered by "corduroy".
+        "include": ["pants", "trousers", "cargo", "corduroy",
                     "chino", "slacks", "track pant", "leggings", "legging"],
     },
     "Dresses": {
@@ -127,20 +136,39 @@ _EXCLUDED_RE = re.compile(
 )
 
 
+def _compile_include(words: list[str]) -> "re.Pattern[str]":
+    """Build a word-boundary, plural-tolerant inclusion matcher for one category.
+
+    Inclusion used to be a bare substring test (``kw in title``), which silently
+    misfires on collisions — "top" ⊂ laptop, "set" ⊂ corset, "lee" ⊂ fleece,
+    "cords" ⊂ records, "tee" ⊂ canteen. Matching on word boundaries kills that whole
+    class of false-positive while the trailing ``(?:e?s)?`` keeps recall on plurals
+    ("jean"→"jeans", "chino"→"chinos", "tee"→"tees", "mom jean"→"mom jeans"). This
+    mirrors the exclusion pass's boundary discipline on the include side.
+    """
+    alts = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+    return re.compile(r"\b(?:" + alts + r")(?:e?s)?\b", re.IGNORECASE)
+
+
+_INCLUDE_RE: dict[str, "re.Pattern[str]"] = {
+    cat: _compile_include(spec["include"]) for cat, spec in CATEGORY_TAXONOMY.items()
+}
+
+
 def _passes_category_filter(title: str, category: str) -> bool:
     """Two-pass filter (§0.8.3): inclusion whitelist, then exclusion blacklist.
 
-    Pass 1 (inclusion, loose substring): the title must contain >= 1 of the
-    category's include keywords — confirms it really is that kind of garment.
+    Pass 1 (inclusion, word-boundary + plural-tolerant): the title must contain >= 1
+    of the category's include keywords as a whole word — confirms it really is that
+    kind of garment without tripping on substrings (see _compile_include).
     Pass 2 (exclusion, strict word-boundary): drop titles whose dominant noun is a
     non-garment (a "jacket belt" passes inclusion on "jacket" but dies on "belt").
     A candidate must pass both; an unknown/empty category fails immediately.
     """
-    tax = CATEGORY_TAXONOMY.get(category)
-    if tax is None:
+    if category not in _INCLUDE_RE:
         return False
     t = title.casefold()
-    if not any(kw in t for kw in tax["include"]):
+    if not _INCLUDE_RE[category].search(t):
         return False           # Pass 1: not the promised garment type
     if _EXCLUDED_RE.search(t):
         return False           # Pass 2: a non-garment item type dominates

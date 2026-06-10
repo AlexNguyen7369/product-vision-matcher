@@ -177,3 +177,31 @@ Baseline before v3: **127 passed, 0 failed**.
 - No source changes in this step — verification only. Offline suite still
   **142 passed, 0 failed**; the v3 feature is now validated against real eBay data.
 
+## 9 — `trending_scorer.py`: tighten inclusion precision
+
+Follow-up to the live eBay run, which surfaced *latent* inclusion false-positives
+(substring collisions that hadn't fired in that sample but would on other data).
+
+- **Matcher upgrade (the main lever):** inclusion changed from a bare substring test
+  (`kw in title`) to a **word-boundary, plural-tolerant regex** per category
+  (`_compile_include` → `_INCLUDE_RE`), mirroring the exclusion pass. The trailing
+  `(?:e?s)?` preserves recall on plurals. This structurally kills a whole class of
+  false-positive: `top`⊄`laptop`, `set`⊄`corset`, `lee`⊄`fleece`, `cords`⊄`records`,
+  `tee`⊄`canteen` — while `jean`→`jeans`, `chino`→`chinos`, `mom jean`→`mom jeans`
+  still match.
+- **List tuning (secondary):**
+  - **Denim:** dropped `flare` (leaks to flare dresses/skirts/trousers; real flare
+    jeans still match on `jeans`/`denim`).
+  - **Pants & Bottoms:** dropped `cords` (collides with the cable sense; `corduroy`
+    covers it).
+  - **Tops:** dropped the over-generic bare `top`; added the specific styles
+    `crop top`, `tank top`, `tube top`, `halter top` (plus `jersey`).
+  - **Outerwear:** added `peacoat`, `raincoat`, `trench` explicitly so compound coats
+    aren't missed now that bare `coat` only matches as a whole word.
+- Tests: Section 17 adds `inclusion matches on word boundaries with plural tolerance`
+  and `tightened include lists (flare/cords/top dropped, coats added)`.
+- **Live re-validation:** re-ran `experiments/live_trending_ebay.py` against live eBay
+  + Redis — still **40 items (8×5)**, every category fully populated and on-topic, no
+  regression from the tighter filter.
+- **142 → 144 passed, 0 failed.**
+
