@@ -83,6 +83,19 @@ After every feature addition or meaningful change, you **must** create a git com
 - Focus on *what* was added or changed, not implementation details.
 - Commit only after tests pass.
 
+## Change Log Policy
+
+Every time a feature is implemented or a meaningful change lands in the codebase,
+you **must** append an entry to `logging.md` at the project root, in the same commit
+as the change. This file is the human-readable, incremental history of what shipped.
+
+- Add a new `## N — <file(s)>: <short title>` section (newest last); never rewrite
+  prior entries.
+- Each entry records *what changed and why*, any non-obvious design decisions or
+  trade-offs, and the resulting test count (`N passed, 0 failed`).
+- Keep it in lockstep with commits: one logical change → one `logging.md` entry →
+  one commit. Update `logging.md` **before** committing so it ships with the change.
+
 ## Testing Policy
 
 Every time a new feature or module is added or modified, you **must**:

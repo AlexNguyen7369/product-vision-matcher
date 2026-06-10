@@ -131,3 +131,49 @@ Baseline before v3: **127 passed, 0 failed**.
   - Cache key carries `v3` and round-trips `category`.
 - **132 → 142 passed, 0 failed.** (Net +15 checks over the v2 baseline of 127.)
 
+## 7 — live Redis smoke test + Change Log Policy
+
+- **Online integration test against a live Redis** (closes the "not yet done" gap
+  for the cache path). Ran a real `redis:7-alpine` container and exercised the v3
+  orchestration against it via `experiments/live_trending_smoke.py` — an in-process
+  vintage-clothing stub provider (no eBay creds needed) driving `get_trending`:
+  - cache **miss** → fetch+score+save to real Redis; the two noise fixtures (a
+    `jacket belt` and a `ceramic mug`) were correctly dropped by the two-pass filter;
+  - real key `trending:ebay:v3:ranked` present with a 10800s (3h) TTL;
+  - output grouped per category (Denim/Tops/Outerwear) with within-category ranks;
+    a low-volume Tops item still scored 5.00 (per-category normalization, live);
+  - cache **hit** → second call served from Redis without invoking the provider.
+- **End-to-end Flask check:** started `server.py` against the same live Redis and
+  `curl`ed `GET /trending` → **HTTP 200** returning the category-grouped JSON (each
+  row carrying `category`), served from the warm cache — proving the
+  server↔Redis↔scorer↔JSON path. The eBay network leg itself was *not* exercised
+  (no `EBAY_CLIENT_ID`/`SECRET` in `.env`); the cache-hit route reaches eBay only on
+  a cold/expired key.
+- Added `experiments/live_trending_smoke.py` as a reusable manual harness (asserts +
+  exits non-zero on failure). It is intentionally **not** part of `src/test_setup.py`
+  (that suite is strictly offline; this one needs a live Redis).
+- **`CLAUDE.md`:** added a **Change Log Policy** requiring a `logging.md` entry in the
+  same commit as every feature/meaningful change (this entry is the first to follow
+  it).
+- Offline suite unchanged: **142 passed, 0 failed.**
+
+## 8 — live end-to-end test against the REAL eBay Browse API
+
+- After eBay OAuth credentials were added to `.env`, ran a genuine cold-cache fetch
+  against the live eBay Browse API + live Redis via `experiments/live_trending_ebay.py`
+  (drives the real `EbayTrendingProvider`, not a stub). This closes the eBay-network
+  gap left open in module 7.
+- Result: minted an application token, ran **38 seed searches across 8 categories**,
+  enriched the top-15-per-category with `getItem`, and returned **40 items (8×5)** in
+  **~109s** (~150 live API calls — comfortably within the 5,000/day budget). The
+  per-category two-pass filter held up on real listings (denim, tees, jackets,
+  dresses, etc. landed in the right buckets; accessories/off-category titles were
+  excluded). Output cached at `trending:ebay:v3:ranked` (ttl 10800s); the second call
+  was a cache hit in ~1ms.
+- The scripts live under `experiments/` which is **gitignored** (repo scratch area),
+  so they are documented here rather than committed. Recreate the run with a live
+  Redis (`docker run -d -p 6379:6379 redis:7-alpine`) and
+  `python experiments/live_trending_ebay.py`.
+- No source changes in this step — verification only. Offline suite still
+  **142 passed, 0 failed**; the v3 feature is now validated against real eBay data.
+
