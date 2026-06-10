@@ -84,3 +84,17 @@ Baseline before v3: **127 passed, 0 failed**.
   on cross-seed dedup. Existing offline mock-transport checks unchanged.
 - **130 → 132 passed, 0 failed.**
 
+## 4 — `trending_cache.py`: schema key bump `v2 → v3` (§0.8.11)
+
+- `SCHEMA_VER = "v3"`. Because the schema version is baked into the key
+  (`trending:ebay:v3:ranked` / `:raw` / `:lock`), the model change (added
+  `category`) is a one-line rename: new writes go to the `v3` prefix, stale `v2`
+  keys are never read again and age out within the 3-hour TTL — no migration code.
+- `category` added to the raw-snapshot keyword rows (`kw_row`) so the cached `:raw`
+  signal dump is faithful for offline re-scoring. `TrendingItem` rows round-trip
+  `category` automatically via `asdict`/`TrendingItem(**d)`.
+- Tests: Section 14 sample fixtures now carry a `category`, and the round-trip check
+  asserts it survives. The schema-version-in-key and old-key-not-read checks remain
+  version-agnostic and pass against `v3`.
+- **132 passed, 0 failed** (no net new checks; existing ones strengthened).
+

@@ -13,7 +13,7 @@ from models import KeywordSignal, SoldSignal, TrendingItem, VolumeSignal
 log = logging.getLogger(__name__)
 
 REDIS_URL             = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-SCHEMA_VER            = "v2"               # bumped: signal model changed (Browse API)
+SCHEMA_VER            = "v3"               # bumped: TrendingItem/KeywordSignal gained `category` (§0.8.11)
 TTL_SECONDS           = 3 * 60 * 60       # 3 hours
 REFRESH_FLOOR_SECONDS = 15 * 60            # warm-refresh when remaining TTL < 15 min
 LOCK_TTL_SECONDS      = 60                 # lock self-expires so a crash can't wedge it
@@ -64,7 +64,7 @@ def _signals_to_json(
 ) -> str:
     def kw_row(k: KeywordSignal) -> dict:
         return {"item_id": k.item_id, "keyword": k.keyword, "rank": k.rank,
-                "title": k.title, "url": k.url,
+                "title": k.title, "url": k.url, "category": k.category,
                 "fetched_at": _dt_to_str(k.fetched_at)}
 
     def v_row(v: VolumeSignal) -> dict:
@@ -87,7 +87,7 @@ def _signals_to_json(
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def load(client: _redis.Redis, marketplace: str = "ebay") -> tuple[list[TrendingItem] | None, int]:
-    """GET trending:ebay:v1:ranked. Returns (items, remaining_ttl_seconds).
+    """GET trending:ebay:<ver>:ranked. Returns (items, remaining_ttl_seconds).
 
     Returns (None, -2) on miss/expired or if Redis is unreachable.
     """

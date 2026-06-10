@@ -1169,11 +1169,11 @@ def _sample_items() -> list[TrendingItem]:
     return [TrendingItem(
         item_id="1", title="Widget", url="https://ebay.com/1", source="eBay",
         rank=1, score=4.5, keyword_rank=1, sold_quantity=100, sold_rate=0.5,
-        norm_keyword=1.0, norm_volume=1.0, norm_sold=1.0,
+        norm_keyword=1.0, norm_volume=1.0, norm_sold=1.0, category="Denim",
     )]
 
 def _sample_signals():
-    kw     = [KeywordSignal("1", "widget", 1, _NOW, "Widget", "https://ebay.com/1")]
+    kw     = [KeywordSignal("1", "widget", 1, _NOW, "Widget", "https://ebay.com/1", "Denim")]
     volume = [VolumeSignal("1", "Widget", 100, _NOW)]
     sold   = [SoldSignal("1", "Widget", 50, 100, 0.5, None, _NOW)]
     return kw, volume, sold
@@ -1205,6 +1205,7 @@ def check_cache_round_trip_fields():
     assert it.title == original.title
     assert it.score == original.score
     assert it.norm_keyword == original.norm_keyword
+    assert it.category == original.category == "Denim"  # v3 category survives round-trip
 
 def check_cache_lock_single_flight():
     r = _fake_client()
@@ -1242,7 +1243,7 @@ def check_cache_old_schema_key_not_read():
 
 run_check("save() then load() round-trips item list", check_cache_save_and_load)
 run_check("load() on empty Redis returns (None, -2)", check_cache_miss_returns_none)
-run_check("round-trip preserves title, score, norm_keyword", check_cache_round_trip_fields)
+run_check("round-trip preserves title, score, norm_keyword, category", check_cache_round_trip_fields)
 run_check("acquire_lock twice: first True, second False", check_cache_lock_single_flight)
 run_check("acquire_lock after release_lock: can re-acquire", check_cache_lock_release)
 run_check("save() writes versioned key containing SCHEMA_VER", check_cache_schema_version_in_key)
