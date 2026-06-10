@@ -1,29 +1,35 @@
 # Trending Items — Feature Architecture
 
-> **Status:** Core pipeline (v2) is fully implemented and tested (127 passed, 0 failed).
-> The v3 precision filter (vintage clothing categories, two-pass filtering, per-category
-> scoring) is **designed but not yet implemented**. Online integration testing with real
+> **Status:** Core pipeline (v2) and the v3 precision filter (vintage clothing
+> categories, two-pass filtering, per-category scoring) are both **fully implemented
+> and tested (142 passed, 0 failed)**. Online integration testing with real
 > credentials and live Redis has not been done.
 
 ---
 
-## What is NOT yet implemented (v3 — see §0.8 for full design)
+## v3 implementation status (see §0.8 for full design)
 
-The v2 pipeline works end-to-end but treats all results as a flat list with no category
-awareness. The following v3 changes are still pending:
+The v3 precision filter is implemented; see `logging.md` for the incremental change
+log. Summary of what landed, per file:
 
-- **`models.py`** — add `category: str` field to `TrendingItem` (§0.8.10)
-- **`trending_fetcher.py`** — increase `max_results` from `10` → `50` per seed; tag each
-  `KeywordSignal` with its category from `CATEGORY_SEED_MAP` during `fetch_keyword_signals`
-  (§0.8.5); limit `getItem` calls to top 15 per category instead of all candidates (§0.8.7)
-- **`trending_scorer.py`** — add `CATEGORY_TAXONOMY` + `EXCLUDED_ITEM_TYPES` constants;
-  replace the current noise gate with the two-pass inclusion/exclusion filter (§0.8.3–§0.8.4);
-  change `score_trending` to normalize and rank **within each category** and return a flat
-  category-tagged list instead of a global top-10 (§0.8.8–§0.8.9)
-- **`trending_cache.py`** — bump `SCHEMA_VER` from `"v2"` → `"v3"` (§0.8.11)
-- **`server.py` / `index.html`** — emit `category` field in the JSON response; group rows
-  by category in the UI table (§0.8.9)
-- **`test_setup.py`** — add Section N covering the v3 filter surface (§0.8.12)
+- **`models.py`** — added `category: str` to `TrendingItem` (§0.8.10) and to
+  `KeywordSignal` (so the category rides the keyword join into the scorer without
+  coupling the scorer to the fetcher's seed map). ✅
+- **`trending_fetcher.py`** — `max_results` `10 → 50` per seed; each `KeywordSignal`
+  is tagged with its category from `CATEGORY_SEED_MAP`, following the best-ranked
+  (winning) seed on cross-seed dedup (§0.8.5). ✅
+- **`trending_scorer.py`** — added `CATEGORY_TAXONOMY` + `EXCLUDED_ITEM_TYPES`;
+  `_passes_category_filter` runs the two-pass inclusion/exclusion filter
+  (§0.8.3–§0.8.4, exclusion is word-boundary matched); `score_trending` normalizes and
+  ranks **within each category** and returns a flat category-tagged list
+  (§0.8.8–§0.8.9). The top-15-per-category `getItem` budgeting (§0.8.7) is driven by
+  `select_enrichment_ids` from the orchestrator (keeps the fetcher decoupled from the
+  taxonomy). ✅
+- **`trending_cache.py`** — `SCHEMA_VER` `"v2" → "v3"` (§0.8.11); `category` added to
+  the raw keyword snapshot. ✅
+- **`server.py` / `index.html`** — `/trending` emits `category`; the UI groups rows
+  by category with per-category sub-headers (§0.8.9, Option A). ✅
+- **`test_setup.py`** — Section 17 covers the v3 filter surface (§0.8.12). ✅
 
 **Data flow summary (once v3 is implemented):**
 
