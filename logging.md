@@ -69,3 +69,18 @@ Baseline before v3: **127 passed, 0 failed**.
   orchestration passes unchanged (stub now yields categorized candidates).
 - **129 → 130 passed, 0 failed.**
 
+## 3 — `trending_fetcher.py`: 50 results/seed + category tagging (§0.8.5)
+
+- `max_results` default `10 → 50` so each of the ~30 category seeds contributes a
+  deeper candidate pool (~1,500 pre-dedup, target ~1,000 unique).
+- `fetch_keyword_signals` now sets `KeywordSignal.category = CATEGORY_SEED_MAP[seed]`
+  for each surfaced item. Because the existing best-rank-wins dedup rebuilds the
+  whole `KeywordSignal` when a lower rank is found, the category automatically
+  follows the **winning seed** — no extra bookkeeping. (`CATEGORY_SEED_MAP` and the
+  v3 seed list already lived in this file from a prior doc-sync commit.)
+- `getItem` budgeting is *not* done here — the orchestrator passes only the
+  top-15-per-category ids (see module 2); the fetcher fetches exactly what it's given.
+- Tests: Section 15 adds category-from-seed tagging and category-follows-best-rank
+  on cross-seed dedup. Existing offline mock-transport checks unchanged.
+- **130 → 132 passed, 0 failed.**
+

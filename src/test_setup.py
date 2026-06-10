@@ -1440,6 +1440,38 @@ def check_fetcher_keyword_dedup_keeps_best_rank():
     by_id = {s.item_id: s.rank for s in signals}
     assert by_id["v1|Y|0"] == 1, f"Y should keep best rank 1, got {by_id['v1|Y|0']}"
 
+def check_fetcher_tags_category_from_seed():
+    """v3: each KeywordSignal inherits its seed's category (CATEGORY_SEED_MAP)."""
+    client = httpx.Client(transport=_mock_transport())
+    p = EbayTrendingProvider(client_id="id", client_secret="secret",
+                             client=client, seed_queries=["flare jeans vintage"])
+    signals = p.fetch_keyword_signals(60)
+    assert signals and all(s.category == "Denim" for s in signals), \
+        f"expected all Denim, got {[s.category for s in signals]}"
+
+def check_fetcher_category_follows_best_rank():
+    """v3: on cross-seed dedup, category follows the best-ranked (winning) seed."""
+    # Y appears under a Tops seed at pos 1 and a Denim seed at pos 2 → category Tops.
+    denim = {"itemSummaries": [
+        {"itemId": "v1|X|0", "title": "X", "itemWebUrl": "u"},
+        {"itemId": "v1|Y|0", "title": "Y", "itemWebUrl": "u"}]}      # Y at pos 2
+    tops  = {"itemSummaries": [
+        {"itemId": "v1|Y|0", "title": "Y", "itemWebUrl": "u"}]}      # Y at pos 1
+    by_seed = {"vintage straight leg jeans": denim, "vintage band tee": tops}
+    def handler(request):
+        url = str(request.url)
+        if "identity/v1/oauth2/token" in url:
+            return httpx.Response(200, json=_OAUTH_FIXTURE)
+        q = httpx.URL(url).params.get("q")
+        return httpx.Response(200, json=by_seed[q])
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    p = EbayTrendingProvider(client_id="id", client_secret="secret", client=client,
+                             seed_queries=["vintage straight leg jeans", "vintage band tee"])
+    signals = p.fetch_keyword_signals(60)
+    by_id = {s.item_id: s for s in signals}
+    assert by_id["v1|Y|0"].category == "Tops", \
+        f"Y should take winning seed's category, got {by_id['v1|Y|0'].category}"
+
 run_check("_validate_key raises when client_id+secret empty", check_fetcher_validate_key_empty)
 run_check("_validate_key raises when only secret missing", check_fetcher_validate_key_missing_secret)
 run_check("_validate_key does not raise when both set", check_fetcher_validate_key_present)
@@ -1452,6 +1484,8 @@ run_check("getItem is memoized across volume+sold for the same id", check_fetche
 run_check("search non-200 raises RuntimeError", check_fetcher_search_non_200_raises)
 run_check("getItem 404 candidate is skipped, not fatal", check_fetcher_getitem_404_skipped)
 run_check("keyword dedup keeps best (lowest) rank across seeds", check_fetcher_keyword_dedup_keeps_best_rank)
+run_check("fetch_keyword_signals tags category from seed (CATEGORY_SEED_MAP)", check_fetcher_tags_category_from_seed)
+run_check("category follows best-ranked seed on cross-seed dedup", check_fetcher_category_follows_best_rank)
 
 # ── section 16: orchestration — get_trending() end-to-end ────────────────────
 

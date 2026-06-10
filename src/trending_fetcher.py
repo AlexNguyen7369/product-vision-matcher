@@ -153,7 +153,7 @@ class EbayTrendingProvider:
         client_secret: str | None = None,   # None → fall back to EBAY_CLIENT_SECRET env var
         client: httpx.Client | None = None,
         timeout: float = 30.0,
-        max_results: int = 10,              # results pulled per seed query
+        max_results: int = 50,              # v3: results pulled per seed query (§0.8.1)
         seed_queries: list[str] | None = None,
         marketplace: str = _MARKETPLACE,
     ) -> None:
@@ -173,13 +173,16 @@ class EbayTrendingProvider:
     def fetch_keyword_signals(self, lookback_days: int) -> list[KeywordSignal]:
         """Search each seed query (Best Match); list position = trending rank.
 
-        Items appearing under more than one seed keep their best (lowest) rank.
+        Items appearing under more than one seed keep their best (lowest) rank, and
+        inherit the **category of that winning seed** (best-rank-wins, §0.8.5) via
+        ``CATEGORY_SEED_MAP``. A seed not in the map yields an empty category.
         """
         self._validate_key()
         now = datetime.now(tz=timezone.utc)
         best: dict[str, KeywordSignal] = {}
 
         for seed in self._seeds:
+            category = CATEGORY_SEED_MAP.get(seed, "")
             data = self._get(
                 f"{_BROWSE_BASE}/item_summary/search",
                 params={"q": seed, "limit": str(self._max_results)},
@@ -196,6 +199,7 @@ class EbayTrendingProvider:
                         fetched_at = now,
                         title      = item.get("title", ""),
                         url        = item.get("itemWebUrl", ""),
+                        category   = category,
                     )
         return list(best.values())
 
