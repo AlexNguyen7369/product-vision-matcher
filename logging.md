@@ -113,3 +113,21 @@ Baseline before v3: **127 passed, 0 failed**.
   tests exist; full suite remains green and `server.py` parses clean.
 - **132 passed, 0 failed.**
 
+## 6 — `test_setup.py`: dedicated v3 filter section (§0.8.12)
+
+- Added `=== Section 17: trending — v3 precision filter ===` with 10 checks:
+  - `CATEGORY_SEED_MAP` is total over `DEFAULT_SEED_QUERIES`, every category has
+    ≥1 seed, and the fetcher's map agrees with the scorer's `CATEGORY_TAXONOMY["seeds"]`.
+  - Inclusion pass (garment keyword passes / off-category dropped); unknown category
+    rejected.
+  - Exclusion word boundaries: `bootcut`/`baggy` survive, `jacket belt` and bare
+    `leather belt` dropped.
+  - `leggings` kept vs `tights` dropped (the deliberate edge case).
+  - Category flows through scoring into the `TrendingItem`.
+  - Per-category normalization protects a low-volume category (Tops top item norms
+    to 1.0 even next to a 10,000-unit Denim category).
+  - `select_enrichment_ids` caps ids at 15/category and keeps the best-ranked ones.
+  - `get_trending` end-to-end bounds `getItem` to ≤15 per category.
+  - Cache key carries `v3` and round-trips `category`.
+- **132 → 142 passed, 0 failed.** (Net +15 checks over the v2 baseline of 127.)
+

@@ -1559,6 +1559,115 @@ run_check("get_trending() second call hits cache (provider not called again)", c
 run_check("get_trending() returns list[TrendingItem]", check_get_trending_returns_list_of_trending_items)
 run_check("get_trending() warm-refreshes when TTL < REFRESH_FLOOR", check_get_trending_warm_refresh_below_floor)
 
+# ── section 17: trending — v3 precision filter (vintage clothing) ─────────────
+
+print("\n=== Section 17: trending — v3 precision filter (§0.8) ===")
+
+from trending_fetcher import DEFAULT_SEED_QUERIES, CATEGORY_SEED_MAP
+
+def check_v3_seed_map_is_total_and_in_sync():
+    """Every seed maps to a real category; every category has >= 1 seed; the
+    fetcher's CATEGORY_SEED_MAP and the scorer's CATEGORY_TAXONOMY["seeds"] match."""
+    # every seed in the fetcher's default list is mapped
+    for seed in DEFAULT_SEED_QUERIES:
+        assert seed in CATEGORY_SEED_MAP, f"unmapped seed: {seed}"
+    # every mapped category is a real taxonomy category
+    for cat in CATEGORY_SEED_MAP.values():
+        assert cat in CATEGORY_TAXONOMY, f"seed map references unknown category: {cat}"
+    # every taxonomy category has at least one seed, and the two halves agree
+    for cat, spec in CATEGORY_TAXONOMY.items():
+        mapped_seeds = {s for s, c in CATEGORY_SEED_MAP.items() if c == cat}
+        assert mapped_seeds, f"category {cat} has no seed in CATEGORY_SEED_MAP"
+        assert set(spec["seeds"]) == mapped_seeds, \
+            f"{cat}: taxonomy seeds {set(spec['seeds'])} != map seeds {mapped_seeds}"
+
+def check_v3_inclusion_pass():
+    assert _passes_category_filter("Vintage Levi's flare denim jeans", "Denim")
+    assert not _passes_category_filter("vintage ceramic coffee mug", "Denim")
+
+def check_v3_unknown_category_rejected():
+    assert not _passes_category_filter("vintage flare jeans", "Footwear")  # not a category
+
+def check_v3_exclusion_word_boundaries():
+    # bootcut must NOT trip the "boot" footwear exclusion
+    assert _passes_category_filter("vintage bootcut jeans", "Denim")
+    # baggy must NOT trip the "bag" exclusion
+    assert _passes_category_filter("vintage baggy jeans", "Denim")
+    # a jacket that is really a belt accessory: passes inclusion (jacket) then dies on belt
+    assert not _passes_category_filter("vintage leather jacket belt", "Outerwear")
+    # a standalone accessory title with no garment keyword is dropped at inclusion
+    assert not _passes_category_filter("vintage leather belt", "Outerwear")
+
+def check_v3_leggings_kept_tights_dropped():
+    """The deliberate edge case: leggings are a garment, tights are hosiery."""
+    assert _passes_category_filter("vintage cargo pants leggings", "Pants & Bottoms")
+    assert _passes_category_filter("vintage high waist leggings", "Pants & Bottoms")
+    assert not _passes_category_filter("vintage sheer tights", "Pants & Bottoms")
+    assert "tights" in EXCLUDED_ITEM_TYPES and "leggings" not in EXCLUDED_ITEM_TYPES
+
+def check_v3_category_flows_into_scored_item():
+    """The assigned category survives all the way into the TrendingItem output."""
+    items = score_trending([_kw("T1", 1, "Tops", "vintage band tee")], [], [])
+    assert items and items[0].category == "Tops"
+
+def check_v3_per_category_normalization():
+    """A low-volume category's top item still normalizes to ~1.0 in its own pool,
+    not crushed by a high-volume category (global norm would near-zero it)."""
+    kw = [_kw("D1", 1, "Denim", "vintage jeans"), _kw("D2", 2, "Denim", "vintage jeans"),
+          _kw("T1", 1, "Tops",  "vintage band tee"), _kw("T2", 2, "Tops", "vintage band tee")]
+    v  = [_v("D1", 10000), _v("D2", 5000), _v("T1", 10), _v("T2", 2)]
+    items = score_trending(kw, v, [])
+    t1 = next(it for it in items if it.item_id == "T1")
+    assert t1.norm_volume == 1.0, f"Tops top item should norm to 1.0, got {t1.norm_volume}"
+
+def check_v3_select_enrichment_caps_per_category():
+    """select_enrichment_ids returns at most GETITEM_PER_CATEGORY ids per category."""
+    kw = ([_kw(f"d{i}", i, "Denim", "vintage jeans") for i in range(1, 21)] +
+          [_kw(f"t{i}", i, "Tops",  "vintage band tee") for i in range(1, 21)])
+    ids = select_enrichment_ids(kw)
+    assert len(ids) == 2 * GETITEM_PER_CATEGORY, f"expected {2*GETITEM_PER_CATEGORY}, got {len(ids)}"
+    assert sum(1 for i in ids if i.startswith("d")) == GETITEM_PER_CATEGORY
+    assert sum(1 for i in ids if i.startswith("t")) == GETITEM_PER_CATEGORY
+    # the kept Denim ids are the best-ranked ones (d1..d15), not d16..d20
+    assert "d16" not in ids and "d1" in ids
+
+def check_v3_orchestrator_bounds_getitem():
+    """End-to-end: get_trending enriches only the top-15-per-category candidates."""
+    captured = {"ids": None}
+    class _DenimProvider:
+        def fetch_keyword_signals(self, lookback_days):
+            return [_kw(f"d{i}", i, "Denim", "vintage jeans") for i in range(1, 21)]
+        def fetch_volume_signals(self, item_ids, lookback_days):
+            captured["ids"] = list(item_ids)
+            return [_v(i, 100) for i in item_ids]
+        def fetch_sold_signals(self, item_ids, lookback_days):
+            return []
+    get_trending(_DenimProvider(), _fake_client())
+    assert captured["ids"] is not None
+    assert len(captured["ids"]) == GETITEM_PER_CATEGORY, \
+        f"getItem should be capped at {GETITEM_PER_CATEGORY}, got {len(captured['ids'])}"
+
+def check_v3_cache_key_carries_v3_and_category():
+    r = _fake_client()
+    assert trending_cache.SCHEMA_VER == "v3"
+    kw, volume, sold = _sample_signals()
+    save(r, _sample_items(), kw, volume, sold)
+    keys = [k.decode() for k in r.keys("trending:*")]
+    assert any(":v3:" in k for k in keys), f"v3 not in keys: {keys}"
+    loaded, _ = load(r)
+    assert loaded[0].category == "Denim"
+
+run_check("CATEGORY_SEED_MAP is total and in sync with CATEGORY_TAXONOMY", check_v3_seed_map_is_total_and_in_sync)
+run_check("inclusion pass: garment keyword passes, off-category dropped", check_v3_inclusion_pass)
+run_check("unknown category is rejected", check_v3_unknown_category_rejected)
+run_check("exclusion pass respects word boundaries (bootcut/baggy survive, belt dropped)", check_v3_exclusion_word_boundaries)
+run_check("leggings kept vs tights dropped (edge case)", check_v3_leggings_kept_tights_dropped)
+run_check("assigned category flows into the scored TrendingItem", check_v3_category_flows_into_scored_item)
+run_check("per-category normalization protects low-volume categories", check_v3_per_category_normalization)
+run_check("select_enrichment_ids caps ids at GETITEM_PER_CATEGORY per category", check_v3_select_enrichment_caps_per_category)
+run_check("get_trending bounds getItem to top-15 per category", check_v3_orchestrator_bounds_getitem)
+run_check("cache key carries v3 and round-trips category", check_v3_cache_key_carries_v3_and_category)
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 print(f"\n{'='*40}")
