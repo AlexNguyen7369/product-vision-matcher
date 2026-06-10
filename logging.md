@@ -98,3 +98,18 @@ Baseline before v3: **127 passed, 0 failed**.
   version-agnostic and pass against `v3`.
 - **132 passed, 0 failed** (no net new checks; existing ones strengthened).
 
+## 5 — `server.py` + `index.html`: emit & group by category (amends §10)
+
+- `server.py` `/trending` JSON now includes `"category": it.category` per row.
+- `index.html`:
+  - Label changed to "Trending vintage clothing on eBay — by category".
+  - `loadTrending()` renders a category sub-header row (`.trend-category-row`,
+    `colspan=6`) whenever the category changes as it walks the server-grouped list
+    (Option A from §0.8.9 — flat category-tagged rows, grouped client-side). `rank`
+    is shown as the within-category position.
+  - Status line reports item count *and* number of categories.
+  - Added `.trend-category-row` CSS (uppercased accent-colored group header).
+- No new HTTP libs / build step (same vanilla-`fetch` approach). No automated UI
+  tests exist; full suite remains green and `server.py` parses clean.
+- **132 passed, 0 failed.**
+

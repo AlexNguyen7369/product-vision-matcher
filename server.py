@@ -86,6 +86,7 @@ def trending():
                     "title":        it.title,
                     "url":          it.url,
                     "source":       it.source,
+                    "category":     it.category,
                     "score":        round(it.score, 3),
                     "keyword_rank":  it.keyword_rank,
                     "sold_quantity": it.sold_quantity,

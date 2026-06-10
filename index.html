@@ -497,6 +497,16 @@
       min-width: 24px;
     }
 
+    .trend-category-row td {
+      padding-top: 14px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--accent2);
+      border-bottom: 1px solid var(--border);
+    }
+
     .score-bar {
       display: flex;
       align-items: center;
@@ -610,7 +620,7 @@
         </div>
 
         <div id="trendingContent" style="display:none">
-          <div class="section-label" id="trendingLabel">Trending on eBay — top 10</div>
+          <div class="section-label" id="trendingLabel">Trending vintage clothing on eBay — by category</div>
           <table>
             <thead>
               <tr>
@@ -678,15 +688,25 @@
 
         trendingLoaded = true;
         dot.className = 'dot success';
-        txt.textContent = `Loaded ${data.items.length} trending items · eBay · 60-day window`;
+        const numCategories = new Set(data.items.map(it => it.category || 'Uncategorized')).size;
+        txt.textContent = `Loaded ${data.items.length} trending items across ${numCategories} categories · eBay · 60-day window`;
 
+        // v3: items arrive grouped by category (taxonomy order). Insert a header
+        // row whenever the category changes; rank is within-category.
+        let lastCategory = null;
         body.innerHTML = data.items.map(it => {
           const scorePct = (it.score / 5) * 100;
           const soldPct  = it.sold_rate != null ? (it.sold_rate * 100).toFixed(0) + '%' : '—';
           const titleCell = it.url
             ? `<a class="listing-link" href="${it.url}" target="_blank" rel="noopener">${it.title}</a>`
             : it.title;
-          return `
+          let header = '';
+          const category = it.category || 'Uncategorized';
+          if (category !== lastCategory) {
+            lastCategory = category;
+            header = `<tr class="trend-category-row"><td colspan="6">${category}</td></tr>`;
+          }
+          return header + `
           <tr>
             <td class="trend-rank">${it.rank}</td>
             <td>${titleCell}</td>
