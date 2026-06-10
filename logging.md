@@ -35,3 +35,37 @@ Baseline before v3: **127 passed, 0 failed**.
   construction for both dataclasses.
 - **127 → 129 passed, 0 failed.**
 
+## 2 — `trending_scorer.py`: two-pass filter + per-category scoring (§0.8.3–§0.8.9)
+
+- Added `CATEGORY_TAXONOMY` (8 categories, each with inclusion-keyword lists) and
+  `EXCLUDED_ITEM_TYPES` (non-garment/accessory blacklist). `leggings`/`legging` are
+  in the Pants & Bottoms include list and kept; `tights` stays excluded (§0.8.4).
+- `_passes_category_filter(title, category)` runs **inclusion** (loose case-folded
+  substring) then **exclusion** (strict, **word-boundary** regex). The pre-compiled
+  `_EXCLUDED_RE` uses `\b` anchors so `bootcut`≠`boot`, `baggy`≠`bag`, `capri`≠`cap`,
+  `earring`≠`ring`; longest terms first so `bucket hat` wins over `hat`.
+- `score_trending` rewritten: build candidates (category rides in on the keyword
+  signal), filter, **group by category**, then normalize/weight/rank *within each
+  category* (`_rank_pool`). Returns a flat `list[TrendingItem]`, each tagged with
+  its category, `rank` = within-category position, top `TOP_N_PER_CATEGORY` (5) per
+  category. Weights (2/2/1) and min-max mechanics unchanged — only the *scope* of
+  min/max moved from global to per-category. Categories emit in taxonomy order.
+- `select_enrichment_ids(keyword_signals, per_category=15)` (§0.8.7): applies the
+  category filter to keyword signals, groups, and returns the top-15-by-rank ids per
+  category — this is what bounds `getItem` (~15×8 ≈ 120 calls) regardless of intake.
+- Orchestrator (`_fetch_and_cache`/`_maybe_refresh`) refactored to a shared
+  `_fetch_and_score` that calls `select_enrichment_ids` before enrichment. The
+  budgeting lives here (the orchestrator already lives in `trending_scorer`), so the
+  fetcher stays a dumb network boundary and never imports the scorer — preserving the
+  module-boundary rule (modules import types from `models`, never each other).
+- **Design note on the doc's "limit getItem in trending_fetcher.py":** functionally
+  the orchestrator decides which ids get enriched. Putting the filter-driven
+  selection in the scorer (which owns `CATEGORY_TAXONOMY`) keeps the fetcher
+  decoupled; coupling the fetcher to the taxonomy would violate the architecture.
+- Tests: Section 13 reworked for v3 — category-aware `_kw` helper; new checks for
+  off-category/excluded-accessory drops, per-category top-N, cross-category
+  grouping, within-category rank, and a genuine 3-item score tie resolved by sold
+  quantity. `_min_max`/`_passes_predicate` unit checks unchanged. Section 16
+  orchestration passes unchanged (stub now yields categorized candidates).
+- **129 → 130 passed, 0 failed.**
+

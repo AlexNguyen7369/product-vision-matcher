@@ -989,10 +989,19 @@ run_check("TrendingItem accepts None for optional signal fields", check_trending
 print("\n=== Section 13: trending_scorer — normalization, filtering, and ranking ===")
 
 import trending_scorer
-from trending_scorer import score_trending, _min_max, _passes_predicate, KEYWORD_WEIGHT, VOLUME_WEIGHT, SOLD_WEIGHT
+from trending_scorer import (
+    score_trending, _min_max, _passes_predicate, _passes_category_filter,
+    select_enrichment_ids, CATEGORY_TAXONOMY, EXCLUDED_ITEM_TYPES,
+    KEYWORD_WEIGHT, VOLUME_WEIGHT, SOLD_WEIGHT,
+    TOP_N_PER_CATEGORY, GETITEM_PER_CATEGORY,
+)
 
-def _kw(item_id, rank):
-    return KeywordSignal(item_id=item_id, keyword="x", rank=rank, fetched_at=_NOW)
+# v3: candidates must carry a category (from the seed) and a title that passes the
+# category's inclusion filter, else they are dropped before scoring. Default to a
+# Denim garment so the existing scoring/normalization checks exercise one category.
+def _kw(item_id, rank, category="Denim", title="vintage denim jeans"):
+    return KeywordSignal(item_id=item_id, keyword="x", rank=rank, fetched_at=_NOW,
+                         title=title, category=category)
 
 def _v(item_id, count, title=""):
     return VolumeSignal(item_id=item_id, title=title, sold_quantity=count, fetched_at=_NOW)
@@ -1044,45 +1053,70 @@ def check_scorer_single_candidate():
     assert len(items) == 1
     assert items[0].score == 5.0
 
-def check_scorer_missing_keyword_signal():
-    """Candidate with no keyword signal gets norm_keyword=0.0."""
-    w = [_v("A", 100), _v("B", 50)]
-    s = [_s("A", 10, 20), _s("B", 5, 20)]
-    items = score_trending([], w, s)
+def check_scorer_missing_volume_within_category():
+    """A categorized candidate missing the volume signal gets norm_volume=0.0."""
+    kw = [_kw("A", 1), _kw("B", 2)]                 # both Denim, pass inclusion
+    s  = [_s("A", 10, 20), _s("B", 5, 20)]
+    items = score_trending(kw, [], s)               # no volume signals supplied
+    assert items, "categorized candidates should survive on keyword + sold alone"
     for it in items:
-        assert it.norm_keyword == 0.0, f"expected 0.0, got {it.norm_keyword}"
-        assert it.keyword_rank is None
+        assert it.norm_volume == 0.0, f"expected 0.0, got {it.norm_volume}"
+        assert it.category == "Denim"
 
-def check_scorer_noise_gate():
-    """Candidate with watch=0 and sold_rate=0 is excluded."""
-    w = [_v("NOISY", 0), _v("GOOD", 50)]
-    s = [
-        SoldSignal("NOISY", "", 0, 10, 0.0, _NOW, _NOW),
-        SoldSignal("GOOD",  "", 5, 10, 0.5, _NOW, _NOW),
+def check_scorer_drops_off_category_titles():
+    """Inclusion/exclusion filter drops a non-garment title even if categorized."""
+    kw = [
+        _kw("GOOD", 1, title="vintage Levi's denim jeans"),  # passes inclusion
+        _kw("BELT", 2, title="vintage leather jacket belt"), # belt → excluded
+        _kw("NONE", 3, title="vintage ceramic mug"),         # no Denim keyword
     ]
-    items = score_trending([], w, s)
+    items = score_trending(kw, [], [])
     ids = [it.item_id for it in items]
-    assert "NOISY" not in ids, f"noise candidate leaked: {ids}"
     assert "GOOD" in ids
+    assert "BELT" not in ids, f"belt accessory leaked: {ids}"
+    assert "NONE" not in ids, f"off-category title leaked: {ids}"
 
-def check_scorer_top_n_limit():
-    """More than 10 candidates → only top 10 returned."""
-    w = [_v(str(i), i * 10) for i in range(1, 16)]
-    items = score_trending([], w, [])
-    assert len(items) == 10
+def check_scorer_top_n_per_category():
+    """More than TOP_N_PER_CATEGORY in one category → only that many returned."""
+    kw = [_kw(str(i), i) for i in range(1, 16)]     # 15 Denim candidates
+    v  = [_v(str(i), i * 10) for i in range(1, 16)]
+    items = score_trending(kw, v, [])
+    assert len(items) == TOP_N_PER_CATEGORY, f"expected {TOP_N_PER_CATEGORY}, got {len(items)}"
 
-def check_scorer_rank_assigned():
-    """rank field counts from 1."""
-    w = [_v("A", 100), _v("B", 50)]
-    items = score_trending([], w, [])
+def check_scorer_groups_multiple_categories():
+    """Items span categories; each category contributes its own ranked block."""
+    kw = [
+        _kw("D1", 1, category="Denim", title="vintage flare jeans"),
+        _kw("D2", 2, category="Denim", title="vintage baggy jeans"),
+        _kw("T1", 1, category="Tops",  title="vintage band tee"),
+    ]
+    items = score_trending(kw, [], [])
+    cats = {it.category for it in items}
+    assert cats == {"Denim", "Tops"}, f"unexpected categories: {cats}"
+    # rank is within-category: Denim has a rank-1 and a rank-2; Tops has a rank-1
+    denim_ranks = sorted(it.rank for it in items if it.category == "Denim")
+    tops_ranks  = sorted(it.rank for it in items if it.category == "Tops")
+    assert denim_ranks == [1, 2] and tops_ranks == [1]
+
+def check_scorer_rank_within_category():
+    """rank counts from 1 within each category."""
+    kw = [_kw("A", 1), _kw("B", 2)]
+    v  = [_v("A", 100), _v("B", 50)]
+    items = score_trending(kw, v, [])
     ranks = sorted(it.rank for it in items)
     assert ranks == [1, 2]
 
 def check_scorer_tiebreak_by_sold_quantity():
-    """Equal scores broken by sold_quantity descending."""
-    w = [_v("A", 100), _v("B", 200)]
-    items = score_trending([], w, [])
-    assert items[0].item_id == "B", "higher sold quantity should rank first on tie"
+    """Equal scores within a category broken by sold_quantity descending."""
+    # A and B both end at score 2.0 (A: keyword-max/volume-min; B: keyword-min/
+    # volume-max); C sits below. The A/B tie must resolve to B (higher sold qty).
+    kw = [_kw("A", 1), _kw("B", 2), _kw("C", 2)]
+    v  = [_v("A", 100), _v("B", 300), _v("C", 200)]
+    items = score_trending(kw, v, [])
+    a = next(it for it in items if it.item_id == "A")
+    b = next(it for it in items if it.item_id == "B")
+    assert abs(a.score - b.score) < 1e-9, f"expected a tie: {a.score} vs {b.score}"
+    assert b.rank < a.rank, "higher sold quantity should rank first on a tie"
 
 def check_passes_predicate_noise_gate():
     # no units sold, zero sell-through, not surfaced by search → dropped
@@ -1108,10 +1142,11 @@ run_check("_min_max None values → 0.0", check_min_max_with_none)
 run_check("_min_max all-None → all 0.0", check_min_max_all_none)
 run_check("score_trending worked example from §6 (A=5.0, B=0.0)", check_scorer_worked_example)
 run_check("score_trending single candidate gets score 5.0", check_scorer_single_candidate)
-run_check("score_trending with missing keyword → norm_keyword=0.0", check_scorer_missing_keyword_signal)
-run_check("score_trending noise gate removes sold=0,rate=0 candidate", check_scorer_noise_gate)
-run_check("score_trending returns at most TOP_N (10) items", check_scorer_top_n_limit)
-run_check("score_trending assigns rank 1..N", check_scorer_rank_assigned)
+run_check("score_trending missing volume within category → norm_volume=0.0", check_scorer_missing_volume_within_category)
+run_check("score_trending drops off-category / excluded-accessory titles", check_scorer_drops_off_category_titles)
+run_check("score_trending returns at most TOP_N_PER_CATEGORY per category", check_scorer_top_n_per_category)
+run_check("score_trending groups output across categories", check_scorer_groups_multiple_categories)
+run_check("score_trending assigns rank 1..N within category", check_scorer_rank_within_category)
 run_check("score_trending tiebreaks by sold_quantity descending", check_scorer_tiebreak_by_sold_quantity)
 run_check("_passes_predicate noise gate (sold=0, rate=0.0, no keyword)", check_passes_predicate_noise_gate)
 run_check("_passes_predicate passes valid candidate", check_passes_predicate_good)
