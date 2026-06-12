@@ -3,7 +3,13 @@
     "allow": [
       "Bash(cat:*)",
       "Bash(ls notes *)",
-      "Bash(cat src/pipeline.py)"
+      "Bash(cat src/pipeline.py)",
+      "WebFetch(domain:developer.ebay.com)",
+      "WebSearch",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git check-ignore *)",
+      "Bash(\"../.venv/Scripts/python.exe\" test_setup.py)"
     ],
     "deny": [],
     "ask": []
